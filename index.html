@@ -1,0 +1,1090 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="theme-color" content="#05060f">
+<title>Sum Shuffle</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Ccircle cx='32' cy='32' r='28' fill='%2322d3ee'/%3E%3Ctext x='32' y='42' font-size='30' font-weight='bold' text-anchor='middle' fill='%23051018' font-family='sans-serif'%3E8%3C/text%3E%3C/svg%3E">
+<style>
+  :root { --sat: env(safe-area-inset-top, 0px); --sab: env(safe-area-inset-bottom, 0px); }
+  * { margin: 0; padding: 0; }
+  html, body {
+    height: 100%;
+    overflow: hidden;
+    background: #05060f;
+    touch-action: none;
+    -webkit-user-select: none;
+    user-select: none;
+    -webkit-tap-highlight-color: transparent;
+    overscroll-behavior: none;
+    position: fixed;
+    width: 100%;
+  }
+  canvas { display: block; position: fixed; inset: 0; width: 100vw; height: 100vh; height: 100dvh; touch-action: none; }
+  #err {
+    display: none; position: fixed; inset: 0; color: #f87171; background: #05060f;
+    font: 16px system-ui, sans-serif; padding: 40px 24px; text-align: center; z-index: 10;
+  }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="err">Couldn't load the physics engine.<br><br>Check your internet connection and reload.</div>
+<script src="https://cdn.jsdelivr.net/npm/matter-js@0.20.0/build/matter.min.js"></script>
+<script>
+'use strict';
+if (typeof Matter === 'undefined') {
+  document.getElementById('err').style.display = 'block';
+  throw new Error('Matter.js failed to load');
+}
+
+/* ============================================================
+   SUM SHUFFLE — neon shuffleboard × 2048
+   ============================================================ */
+
+const { Engine, Bodies, Body, Composite, Events, Vector } = Matter;
+
+// ---------- Tunables ----------
+const START_TIME   = 90;      // seconds per round
+const OBJ_TIME = { 4: 4, 8: 6, 16: 9, 32: 12, 64: 15, 128: 18, 256: 22, 512: 26 }; // seconds granted per completed target
+const MERGE_SPEED  = 1.4;     // min relative speed for equal pucks to fuse
+const FRICTION_AIR = 0.013;   // glide decay — lower = longer, punchier glides
+const MIN_POWER    = 6, MAX_POWER = 16;
+const MERGE_CARRY  = 1.6;     // follow-through: merged pucks keep boosted momentum so they can chain into the next puck
+const LAUNCH_DECAY = 0.5;     // each higher launch value is this much as likely as the one below it
+const LAUNCH_COOLDOWN = 380;  // ms between shots
+const AIM_MAX_TILT = 1.22;    // radians either side of straight up
+
+const OBJ_POINTS = { 4: 40, 8: 100, 16: 240, 32: 600, 64: 1400, 128: 3200, 256: 7000, 512: 15000 };
+const PALETTE = ['#22d3ee','#a78bfa','#f472b6','#fb923c','#facc15','#4ade80','#f87171','#60a5fa','#2dd4bf','#e879f9','#fef08a','#f0abfc'];
+
+const log2 = v => Math.round(Math.log2(v));
+const puckColor = v => PALETTE[Math.min(log2(v), PALETTE.length - 1)];
+const puckRadius = v => 16 + 3.2 * log2(v);
+const clamp = (x, a, b) => Math.min(b, Math.max(a, x));
+const lerp = (a, b, t) => a + (b - a) * t;
+const rnd = (a, b) => a + Math.random() * (b - a);
+
+// ---------- Canvas ----------
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+let W = 0, H = 0, DPR = 1;
+let safeTop = 0, safeBottom = 0;
+// Layout (recomputed on resize)
+let hudH, playTop, playBottom, playLeft, playRight, launcherX, launcherY, launchLineY, chipY, chipH;
+
+function readSafeArea() {
+  const cs = getComputedStyle(document.documentElement);
+  safeTop = parseFloat(cs.getPropertyValue('--sat')) || 0;
+  safeBottom = parseFloat(cs.getPropertyValue('--sab')) || 0;
+}
+
+function resize() {
+  readSafeArea();
+  DPR = Math.min(window.devicePixelRatio || 1, 3);
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = Math.round(W * DPR);
+  canvas.height = Math.round(H * DPR);
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+
+  chipY = safeTop + 64;
+  chipH = 52;
+  hudH = chipY + chipH + 12;
+  playTop = hudH;
+  playBottom = H - safeBottom - 10;
+  playLeft = 8;
+  playRight = W - 8;
+  launcherX = W / 2;
+  launcherY = playBottom - 58;
+  launchLineY = launcherY - 80;
+  rebuildWalls();
+}
+window.addEventListener('resize', resize);
+
+// ---------- Audio (all sounds synthesized) ----------
+let AC = null, master = null, noiseBuf = null, lastHitSound = 0;
+
+function initAudio() {
+  if (AC) { if (AC.state === 'suspended') AC.resume(); return; }
+  try {
+    AC = new (window.AudioContext || window.webkitAudioContext)();
+    master = AC.createGain();
+    master.gain.value = 0.5;
+    master.connect(AC.destination);
+    const len = AC.sampleRate;
+    noiseBuf = AC.createBuffer(1, len, AC.sampleRate);
+    const d = noiseBuf.getChannelData(0);
+    for (let i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
+  } catch (e) { AC = null; }
+}
+
+function tone(freq, type, dur, vol, slideTo, delay) {
+  if (!AC) return;
+  const t0 = AC.currentTime + (delay || 0);
+  const o = AC.createOscillator(), g = AC.createGain();
+  o.type = type; o.frequency.setValueAtTime(freq, t0);
+  if (slideTo) o.frequency.exponentialRampToValueAtTime(slideTo, t0 + dur);
+  g.gain.setValueAtTime(0, t0);
+  g.gain.linearRampToValueAtTime(vol, t0 + 0.008);
+  g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+  o.connect(g); g.connect(master);
+  o.start(t0); o.stop(t0 + dur + 0.05);
+}
+
+function noiseHit(dur, vol, freq, q, slideTo, delay) {
+  if (!AC) return;
+  const t0 = AC.currentTime + (delay || 0);
+  const s = AC.createBufferSource(); s.buffer = noiseBuf; s.loop = true;
+  const f = AC.createBiquadFilter(); f.type = 'bandpass'; f.Q.value = q || 1;
+  f.frequency.setValueAtTime(freq, t0);
+  if (slideTo) f.frequency.exponentialRampToValueAtTime(slideTo, t0 + dur);
+  const g = AC.createGain();
+  g.gain.setValueAtTime(0, t0);
+  g.gain.linearRampToValueAtTime(vol, t0 + 0.01);
+  g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+  s.connect(f); f.connect(g); g.connect(master);
+  s.start(t0); s.stop(t0 + dur + 0.05);
+}
+
+const MERGE_NOTES = [262, 330, 392, 523, 659, 784, 1047, 1319, 1568, 2093, 2637];
+const sfx = {
+  launch(p) { const k = clamp((p - MIN_POWER) / (MAX_POWER - MIN_POWER), 0, 1); noiseHit(0.22, 0.16 + 0.12 * k, 500 + 500 * k, 1.2, 1600 + 900 * k); },
+  hit(i) {
+    const now = performance.now();
+    if (now - lastHitSound < 45) return;
+    lastHitSound = now;
+    const v = clamp(i, 0, 1);
+    tone(85 + 40 * v, 'sine', 0.07, 0.22 * v);
+    noiseHit(0.035, 0.14 * v, 2600, 2);
+  },
+  merge(v) {
+    const n = Math.min(log2(v) - 1, MERGE_NOTES.length - 1);
+    const f = MERGE_NOTES[Math.max(0, n)];
+    tone(f, 'triangle', 0.3, 0.3);
+    tone(f * 1.5, 'triangle', 0.25, 0.18, null, 0.03);
+    noiseHit(0.06, 0.1, 3800, 3);
+  },
+  objective() { [523, 659, 784, 1047].forEach((f, i) => { tone(f, 'sine', 0.22, 0.24, null, i * 0.06); tone(f, 'triangle', 0.18, 0.1, null, i * 0.06); }); },
+  timeBonus() { tone(880, 'sine', 0.35, 0.24, 1760); tone(2093, 'sine', 0.15, 0.14, null, 0.12); tone(2637, 'sine', 0.18, 0.12, null, 0.2); },
+  tick() { tone(1050, 'square', 0.035, 0.1); },
+  gameOver() { [392, 330, 262, 196].forEach((f, i) => tone(f, 'sawtooth', 0.28, 0.14, f * 0.94, i * 0.16)); },
+  start() { tone(523, 'triangle', 0.15, 0.2); tone(784, 'triangle', 0.2, 0.2, null, 0.09); }
+};
+
+// ---------- Physics ----------
+const engine = Engine.create();
+engine.gravity.x = 0; engine.gravity.y = 0;
+const world = engine.world;
+let walls = [];
+
+// collision categories: the launch line is a one-way barrier — pucks ignore
+// it until they have fully crossed above it, then it becomes solid for them
+const CAT_PUCK = 0x0001, CAT_BARRIER = 0x0002;
+
+function rebuildWalls() {
+  for (const w of walls) Composite.remove(world, w);
+  const T = 80; // thickness, centered outside the play edge
+  const opts = { isStatic: true, restitution: 0.5, friction: 0.01, label: 'wall' };
+  walls = [
+    Bodies.rectangle((playLeft + playRight) / 2, playTop - T / 2, W + T * 2, T, opts),
+    Bodies.rectangle((playLeft + playRight) / 2, playBottom + T / 2, W + T * 2, T, opts),
+    Bodies.rectangle(playLeft - T / 2, H / 2, T, H * 2, opts),
+    Bodies.rectangle(playRight + T / 2, H / 2, T, H * 2, opts),
+    Bodies.rectangle((playLeft + playRight) / 2, launchLineY + 20, playRight - playLeft, 40, {
+      isStatic: true, restitution: 0.5, friction: 0.01, label: 'launchline',
+      collisionFilter: { category: CAT_BARRIER, mask: 0xFFFFFFFF }
+    }),
+  ];
+  Composite.add(world, walls);
+}
+
+// ---------- Game state ----------
+let state = 'menu';            // menu | play | over
+let mode = 'timed';            // timed | zen
+let menuButtons = null, zenExitRect = null;
+let score = 0, scoreShown = 0, best = 0;
+let timeLeft = START_TIME;
+let lastTickSecond = -1;
+let objective = null, nextObjective = null;   // {value, points, time, flash}
+let objectivesCompleted = 0;
+let pucks = [];                // {body, value, r, color, trail[]}
+let currentValue = 1, nextValue = 2;
+let lastLaunch = -1e9;
+let overAt = 0, startedAt = 0;
+let biggestPuck = 0;
+let shake = { t: 0, mag: 0 };
+
+try { best = +localStorage.getItem('sumshuffle_best') || 0; } catch (e) {}
+
+// Effects
+let particles = [], floaters = [], shockwaves = [];
+
+// Aiming
+let aiming = false, aimId = -1, aimX = 0, aimY = 0;
+
+// ---------- Pucks ----------
+function createPuck(x, y, value, vx, vy) {
+  const r = puckRadius(value);
+  const crossed = y < launchLineY;
+  const body = Bodies.circle(x, y, r, {
+    frictionAir: FRICTION_AIR,
+    restitution: 0.62,
+    friction: 0.01,
+    density: 0.0015,
+    label: 'puck',
+    collisionFilter: { category: CAT_PUCK, mask: crossed ? 0xFFFFFFFF : (0xFFFFFFFF ^ CAT_BARRIER) }
+  });
+  const p = { body, value, r, color: puckColor(value), trail: [], born: performance.now(), crossed };
+  body.plugin.puck = p;
+  Body.setVelocity(body, { x: vx || 0, y: vy || 0 });
+  Composite.add(world, body);
+  pucks.push(p);
+  if (value > biggestPuck) biggestPuck = value;
+  return p;
+}
+
+function removePuck(p) {
+  const i = pucks.indexOf(p);
+  if (i >= 0) pucks.splice(i, 1);
+  Composite.remove(world, p.body);
+}
+
+function randLaunchValue() {
+  // launchable values go up to the biggest puck on the board, each doubling
+  // half as likely as the one below it (small values always dominate)
+  const biggest = pucks.reduce((m, p) => Math.max(m, p.value), 0);
+  const maxExp = clamp(log2(Math.max(2, biggest)), 1, 8);
+  let total = 0;
+  const weights = [];
+  for (let k = 0; k <= maxExp; k++) { const w = Math.pow(LAUNCH_DECAY, k); weights.push(w); total += w; }
+  let roll = Math.random() * total;
+  for (let k = 0; k <= maxExp; k++) { roll -= weights[k]; if (roll <= 0) return Math.pow(2, k); }
+  return 1;
+}
+
+// ---------- Objectives ----------
+function objectivePool() {
+  const c = objectivesCompleted;
+  if (c < 2) return [4, 8];
+  if (c < 5) return [8, 16];
+  if (c < 8) return [16, 32];
+  if (c < 12) return [16, 32, 64];
+  if (c < 17) return [32, 64, 128];
+  return [64, 128, 256];
+}
+
+function makeObjective(excludeValue) {
+  const base = objectivePool();
+  const biggest = pucks.reduce((m, p) => Math.max(m, p.value), 0);
+  const cap = Math.max(8, biggest * 4); // never ask for something wildly beyond the board
+  let pool = base.filter(v => v !== excludeValue && v <= cap);
+  if (!pool.length) pool = [Math.min(...base)];
+  const value = pool[Math.floor(Math.random() * pool.length)];
+  return { value, points: OBJ_POINTS[value] || value * 25, time: OBJ_TIME[value] || 25, flash: 0 };
+}
+
+function completeObjective(puck) {
+  const o = objective;
+  const { x, y } = puck.body.position;
+  removePuck(puck);
+  if (mode === 'timed') score += o.points;
+  objectivesCompleted++;
+  burst(x, y, puckColor(o.value), 42, 5);
+  shockwaves.push({ x, y, r: puck.r, maxR: 130, life: 1, color: puckColor(o.value) });
+  floaters.push({ x, y: y - 10, text: mode === 'timed' ? `TARGET! +${o.points}` : 'TARGET!', color: '#fef08a', size: 22, life: 1, vy: -0.7 });
+  shake.t = 0.25; shake.mag = 5;
+  sfx.objective();
+  if (mode === 'timed') {
+    timeLeft = Math.min(timeLeft + o.time, 599);
+    floaters.push({ x, y: y + 22, text: `+${o.time}s`, color: '#facc15', size: 17, life: 1, vy: -0.5 });
+    floaters.push({ x: W - 70, y: safeTop + 44, text: `+${o.time}s`, color: '#facc15', size: 24, life: 1, vy: -0.4 });
+    setTimeout(() => sfx.timeBonus(), 150);
+  }
+  objective = nextObjective;
+  objective.flash = 1;
+  nextObjective = makeObjective(objective.value);
+  // a puck built earlier may already match the fresh target — cash it in
+  setTimeout(() => {
+    if (state !== 'play') return;
+    const hit = pucks.find(p => p.value === objective.value);
+    if (hit) completeObjective(hit);
+  }, 450);
+}
+
+// ---------- Merging ----------
+const mergeQueue = [];
+const mergedIds = new Set();
+
+Events.on(engine, 'collisionStart', ev => {
+  for (const pair of ev.pairs) {
+    const a = pair.bodyA, b = pair.bodyB;
+    const pa = a.plugin && a.plugin.puck, pb = b.plugin && b.plugin.puck;
+    const rel = Vector.magnitude(Vector.sub(a.velocity, b.velocity));
+    if (pa && pb) {
+      if (rel > 0.8) sfx.hit(rel / 9);
+      // merges only happen on the board proper — the launch zone is inert
+      const onBoard = a.position.y < launchLineY && b.position.y < launchLineY;
+      if (onBoard && pa.value === pb.value && rel >= MERGE_SPEED && !mergedIds.has(a.id) && !mergedIds.has(b.id)) {
+        mergedIds.add(a.id); mergedIds.add(b.id);
+        mergeQueue.push([pa, pb]);
+      }
+    } else if (pa || pb) {
+      if (rel > 1.2) sfx.hit(rel / 14);
+    }
+  }
+});
+
+function processMerges() {
+  while (mergeQueue.length) {
+    const [pa, pb] = mergeQueue.shift();
+    if (!pucks.includes(pa) || !pucks.includes(pb)) continue;
+    const A = pa.body, B = pb.body;
+    const x = (A.position.x + B.position.x) / 2;
+    const y = (A.position.y + B.position.y) / 2;
+    const vx = (A.velocity.x + B.velocity.x) / 2 * MERGE_CARRY;
+    const vy = (A.velocity.y + B.velocity.y) / 2 * MERGE_CARRY;
+    const nv = pa.value * 2;
+    removePuck(pa); removePuck(pb);
+    const np = createPuck(x, y, nv, vx, vy);
+    burst(x, y, np.color, 18, 3.2);
+    if (mode === 'timed') {
+      score += nv;
+      floaters.push({ x, y: y - np.r - 6, text: '+' + nv, color: np.color, size: 17, life: 1, vy: -0.6 });
+    }
+    shake.t = Math.max(shake.t, 0.08); shake.mag = Math.max(shake.mag, 2);
+    sfx.merge(nv);
+    if (objective && np.value === objective.value) completeObjective(np);
+  }
+  mergedIds.clear();
+}
+
+// ---------- Effects ----------
+function burst(x, y, color, n, speed) {
+  for (let i = 0; i < n; i++) {
+    const a = Math.random() * Math.PI * 2;
+    const s = rnd(0.3, 1) * speed;
+    particles.push({
+      x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s,
+      life: 1, decay: rnd(1.2, 2.6), size: rnd(1.5, 4), color
+    });
+  }
+}
+
+function updateEffects(dt) {
+  for (let i = particles.length - 1; i >= 0; i--) {
+    const p = particles[i];
+    p.x += p.vx; p.y += p.vy;
+    p.vx *= 0.96; p.vy *= 0.96;
+    p.life -= p.decay * dt;
+    if (p.life <= 0) particles.splice(i, 1);
+  }
+  for (let i = floaters.length - 1; i >= 0; i--) {
+    const f = floaters[i];
+    f.y += f.vy; f.life -= dt * 0.9;
+    if (f.life <= 0) floaters.splice(i, 1);
+  }
+  for (let i = shockwaves.length - 1; i >= 0; i--) {
+    const s = shockwaves[i];
+    s.life -= dt * 2.2;
+    if (s.life <= 0) shockwaves.splice(i, 1);
+  }
+  if (objective && objective.flash > 0) objective.flash = Math.max(0, objective.flash - dt * 1.5);
+  if (shake.t > 0) shake.t -= dt;
+}
+
+// ---------- Round control ----------
+function startGame() {
+  for (const p of [...pucks]) removePuck(p);
+  particles = []; floaters = []; shockwaves = []; mergeQueue.length = 0;
+  score = 0; scoreShown = 0; timeLeft = START_TIME; lastTickSecond = -1;
+  objectivesCompleted = 0; biggestPuck = 0;
+  objective = makeObjective();
+  nextObjective = makeObjective(objective.value);
+  currentValue = randLaunchValue(); nextValue = randLaunchValue();
+  lastLaunch = -1e9;
+  aiming = false;
+  startedAt = performance.now();
+  // a few starter pucks so the board is alive from shot one
+  const midY = lerp(playTop, playBottom, 0.38);
+  const vals = [1, 2, 2];
+  for (let i = 0; i < 3; i++) {
+    createPuck(lerp(playLeft + 50, playRight - 50, (i + 0.5) / 3) + rnd(-15, 15), midY + rnd(-50, 50), vals[i]);
+  }
+  state = 'play';
+  sfx.start();
+}
+
+function endGame() {
+  state = 'over';
+  overAt = performance.now();
+  aiming = false;
+  if (score > best) {
+    best = score;
+    try { localStorage.setItem('sumshuffle_best', best); } catch (e) {}
+  }
+  sfx.gameOver();
+}
+
+// ---------- Input ----------
+function canLaunch() {
+  return state === 'play' && performance.now() - lastLaunch > LAUNCH_COOLDOWN;
+}
+
+function aimVector() {
+  let dx = aimX - launcherX, dy = aimY - launcherY;
+  const d = Math.hypot(dx, dy);
+  if (d < 4) return null;
+  let ang = Math.atan2(dy, dx);
+  // clamp around straight up (-PI/2)
+  let off = ang + Math.PI / 2;
+  while (off > Math.PI) off -= Math.PI * 2;
+  while (off < -Math.PI) off += Math.PI * 2;
+  off = clamp(off, -AIM_MAX_TILT, AIM_MAX_TILT);
+  ang = -Math.PI / 2 + off;
+  // full power is reached when the drag spans from the launcher to about mid-screen
+  const maxDrag = Math.max(120, launcherY - H * 0.5);
+  const power = d < 30 ? 0 : lerp(MIN_POWER, MAX_POWER, clamp((d - 30) / maxDrag, 0, 1));
+  return { dx: Math.cos(ang), dy: Math.sin(ang), power };
+}
+
+function launch() {
+  const v = aimVector();
+  if (!v || v.power <= 0) return;
+  const p = createPuck(launcherX, launcherY, currentValue, v.dx * v.power, v.dy * v.power);
+  burst(launcherX, launcherY + 6, p.color, 8, 2);
+  sfx.launch(v.power);
+  lastLaunch = performance.now();
+  currentValue = nextValue;
+  nextValue = randLaunchValue();
+}
+
+const inRect = (px, py, r) => r && px >= r.x && px <= r.x + r.w && py >= r.y && py <= r.y + r.h;
+
+canvas.addEventListener('pointerdown', e => {
+  e.preventDefault();
+  initAudio();
+  if (state === 'menu') {
+    if (inRect(e.clientX, e.clientY, menuButtons && menuButtons.timed)) { mode = 'timed'; startGame(); }
+    else if (inRect(e.clientX, e.clientY, menuButtons && menuButtons.zen)) { mode = 'zen'; startGame(); }
+    return;
+  }
+  if (state === 'over') { if (performance.now() - overAt > 700) state = 'menu'; return; }
+  if (mode === 'zen' && inRect(e.clientX, e.clientY, zenExitRect)) { state = 'menu'; return; }
+  if (!aiming && canLaunch()) {
+    aiming = true; aimId = e.pointerId;
+    aimX = e.clientX; aimY = e.clientY;
+  }
+});
+canvas.addEventListener('pointermove', e => {
+  if (aiming && e.pointerId === aimId) { aimX = e.clientX; aimY = e.clientY; }
+});
+function endAim(e, fire) {
+  if (aiming && e.pointerId === aimId) {
+    aiming = false;
+    if (fire && state === 'play') launch();
+  }
+}
+canvas.addEventListener('pointerup', e => endAim(e, true));
+canvas.addEventListener('pointercancel', e => endAim(e, false));
+// block iOS double-tap zoom / long-press
+canvas.addEventListener('touchstart', e => e.preventDefault(), { passive: false });
+document.addEventListener('gesturestart', e => e.preventDefault());
+
+// ---------- Main loop ----------
+let lastT = performance.now(), acc = 0;
+const STEP = 1000 / 60;
+
+function frame(now) {
+  requestAnimationFrame(frame);
+  let dtMs = Math.min(now - lastT, 50); // clamp: pauses in background
+  lastT = now;
+  const dt = dtMs / 1000;
+
+  if (state === 'play') {
+    acc += dtMs;
+    let steps = 0;
+    while (acc >= STEP && steps < 4) {
+      Engine.update(engine, STEP);
+      processMerges();
+      acc -= STEP; steps++;
+    }
+    if (steps === 4) acc = 0;
+
+    // trails + cleanup of escapees
+    for (let i = pucks.length - 1; i >= 0; i--) {
+      const p = pucks[i];
+      const b = p.body;
+      p.trail.push({ x: b.position.x, y: b.position.y });
+      if (p.trail.length > 8) p.trail.shift();
+      if (b.position.x < -80 || b.position.x > W + 80 || b.position.y < -80 || b.position.y > H + 80) { removePuck(p); continue; }
+      if (!p.crossed) {
+        if (b.position.y < launchLineY - p.r) {
+          // fully cleared the launch line — it is now solid for this puck
+          p.crossed = true;
+          b.collisionFilter.mask = 0xFFFFFFFF;
+        } else if (now - p.born > 800 && b.position.y > launchLineY && b.velocity.y > -1) {
+          // still below the line and not climbing — stalled or knocked back; clear it
+          burst(b.position.x, b.position.y, p.color, 10, 1.6);
+          floaters.push({ x: b.position.x, y: b.position.y, text: 'SHORT', color: 'rgba(150,160,200,0.9)', size: 13, life: 0.8, vy: -0.5 });
+          removePuck(p);
+        }
+      }
+    }
+
+    if (mode === 'timed') {
+      timeLeft -= dt;
+      const s = Math.ceil(timeLeft);
+      if (timeLeft <= 10 && s !== lastTickSecond && timeLeft > 0) { lastTickSecond = s; sfx.tick(); }
+      if (timeLeft <= 0) { timeLeft = 0; endGame(); }
+    }
+  }
+
+  scoreShown = Math.abs(score - scoreShown) < 1 ? score : lerp(scoreShown, score, 1 - Math.pow(0.001, dt));
+  updateEffects(dt);
+  render(now);
+}
+
+// ---------- Rendering ----------
+function roundRect(x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+
+function drawBackground(now) {
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, '#0a0d21');
+  g.addColorStop(0.55, '#070917');
+  g.addColorStop(1, '#0c0716');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, W, H);
+  // dot grid
+  ctx.fillStyle = 'rgba(120,140,255,0.05)';
+  for (let y = playTop + 20; y < playBottom; y += 44) {
+    for (let x = playLeft + 22; x < playRight; x += 44) {
+      ctx.fillRect(x, y, 2, 2);
+    }
+  }
+}
+
+function drawBoardFrame() {
+  ctx.save();
+  ctx.strokeStyle = 'rgba(99,102,241,0.55)';
+  ctx.shadowColor = '#6366f1';
+  ctx.shadowBlur = 14;
+  ctx.lineWidth = 2;
+  roundRect(playLeft, playTop, playRight - playLeft, playBottom - playTop, 14);
+  ctx.stroke();
+  ctx.restore();
+  // launch line (one-way barrier)
+  ctx.save();
+  ctx.setLineDash([7, 9]);
+  ctx.strokeStyle = 'rgba(34,211,238,0.45)';
+  ctx.shadowColor = '#22d3ee';
+  ctx.shadowBlur = 6;
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  ctx.moveTo(playLeft + 14, launchLineY);
+  ctx.lineTo(playRight - 14, launchLineY);
+  ctx.stroke();
+  ctx.restore();
+}
+
+function drawTargetWatermark() {
+  if (state !== 'play' || !objective) return;
+  const v = objective.value;
+  const cx = (playLeft + playRight) / 2;
+  const cy = lerp(playTop, playBottom, 0.33);
+  const size = Math.min(W * 0.42, 170);
+  ctx.save();
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillStyle = puckColor(v);
+  ctx.globalAlpha = 0.09;
+  ctx.font = `800 ${size}px system-ui, sans-serif`;
+  ctx.fillText(v, cx, cy);
+  ctx.globalAlpha = 0.14;
+  ctx.font = '700 19px system-ui, sans-serif';
+  ctx.fillText(`${v / 2} + ${v / 2}`, cx, cy + size * 0.62);
+  ctx.restore();
+}
+
+function drawPuckAt(x, y, r, value, color, alpha) {
+  ctx.save();
+  ctx.globalAlpha = alpha == null ? 1 : alpha;
+  ctx.shadowColor = color;
+  ctx.shadowBlur = 18;
+  const g = ctx.createRadialGradient(x - r * 0.3, y - r * 0.35, r * 0.15, x, y, r);
+  g.addColorStop(0, color);
+  g.addColorStop(0.75, color);
+  g.addColorStop(1, 'rgba(5,6,15,0.9)');
+  ctx.fillStyle = g;
+  ctx.beginPath();
+  ctx.arc(x, y, r, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.shadowBlur = 0;
+  ctx.strokeStyle = 'rgba(255,255,255,0.85)';
+  ctx.lineWidth = 1.6;
+  ctx.beginPath();
+  ctx.arc(x, y, r - 1.2, 0, Math.PI * 2);
+  ctx.stroke();
+  ctx.fillStyle = '#0b0e1c';
+  ctx.font = `800 ${Math.max(12, r * 0.85)}px system-ui, -apple-system, sans-serif`;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(value, x, y + r * 0.05);
+  ctx.restore();
+}
+
+function drawPucks() {
+  // trails
+  ctx.save();
+  ctx.globalCompositeOperation = 'lighter';
+  for (const p of pucks) {
+    const b = p.body;
+    const sp = Math.hypot(b.velocity.x, b.velocity.y);
+    if (sp < 1.4 || p.trail.length < 2) continue;
+    for (let i = 0; i < p.trail.length - 1; i++) {
+      const t = i / p.trail.length;
+      ctx.globalAlpha = t * 0.16 * clamp(sp / 8, 0, 1);
+      ctx.fillStyle = p.color;
+      ctx.beginPath();
+      ctx.arc(p.trail[i].x, p.trail[i].y, p.r * (0.4 + 0.5 * t), 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+  ctx.restore();
+  for (const p of pucks) drawPuckAt(p.body.position.x, p.body.position.y, p.r, p.value, p.color);
+  // pucks one merge away from the target pulse in its color
+  if (state === 'play' && objective) {
+    const half = objective.value / 2;
+    const tc = puckColor(objective.value);
+    const pulse = 0.5 + 0.5 * Math.sin(performance.now() / 260);
+    ctx.save();
+    ctx.strokeStyle = tc;
+    ctx.shadowColor = tc;
+    for (const p of pucks) {
+      if (p.value !== half) continue;
+      ctx.globalAlpha = 0.35 + 0.4 * pulse;
+      ctx.shadowBlur = 10;
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(p.body.position.x, p.body.position.y, p.r + 5, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+}
+
+function drawLauncher(now) {
+  const ready = canLaunch();
+  const pulse = 1 + 0.04 * Math.sin(now / 260);
+  const r = puckRadius(currentValue);
+  // pad ring
+  ctx.save();
+  ctx.strokeStyle = ready ? 'rgba(34,211,238,0.5)' : 'rgba(120,130,160,0.25)';
+  ctx.setLineDash([4, 6]);
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  ctx.arc(launcherX, launcherY, (r + 10) * pulse, 0, Math.PI * 2);
+  ctx.stroke();
+  ctx.restore();
+  drawPuckAt(launcherX, launcherY, r, currentValue, puckColor(currentValue), ready ? 1 : 0.45);
+  // next preview
+  const nr = 13;
+  const nx = playRight - 34, ny = launcherY;
+  ctx.save();
+  ctx.fillStyle = 'rgba(150,160,200,0.55)';
+  ctx.font = '600 10px system-ui, sans-serif';
+  ctx.textAlign = 'center';
+  ctx.fillText('NEXT', nx, ny - nr - 8);
+  ctx.restore();
+  drawPuckAt(nx, ny, nr, nextValue, puckColor(nextValue), 0.75);
+  // hint early in round
+  if (state === 'play' && pucks.length <= 4 && performance.now() - startedAt < 6000 && !aiming) {
+    ctx.save();
+    ctx.globalAlpha = 0.5 + 0.3 * Math.sin(now / 300);
+    ctx.fillStyle = '#8b95c9';
+    ctx.font = '600 13px system-ui, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('touch & drag to aim — release to shoot', W / 2, launcherY - 84);
+    ctx.restore();
+  }
+}
+
+function drawAimGuide() {
+  if (!aiming || state !== 'play') return;
+  const v = aimVector();
+  if (!v || v.power <= 0) return;
+  const r = puckRadius(currentValue);
+  const total = lerp(130, 470, (v.power - MIN_POWER) / (MAX_POWER - MIN_POWER));
+  // cast with one wall reflection
+  let px = launcherX, py = launcherY, dx = v.dx, dy = v.dy, remain = total;
+  const minX = playLeft + r, maxX = playRight - r, minY = playTop + r;
+  const segs = [];
+  for (let k = 0; k < 2 && remain > 1; k++) {
+    let t = remain;
+    let hitWall = null;
+    if (dx > 1e-6) { const tx = (maxX - px) / dx; if (tx < t) { t = tx; hitWall = 'x'; } }
+    if (dx < -1e-6) { const tx = (minX - px) / dx; if (tx < t) { t = tx; hitWall = 'x'; } }
+    if (dy < -1e-6) { const ty = (minY - py) / dy; if (ty < t) { t = ty; hitWall = 'y'; } }
+    segs.push({ x1: px, y1: py, x2: px + dx * t, y2: py + dy * t });
+    px += dx * t; py += dy * t; remain -= t;
+    if (hitWall === 'x') dx = -dx;
+    else if (hitWall === 'y') dy = -dy;
+    else break;
+  }
+  ctx.save();
+  const color = puckColor(currentValue);
+  ctx.shadowColor = color;
+  ctx.shadowBlur = 8;
+  let drawn = 0;
+  for (let si = 0; si < segs.length; si++) {
+    const s = segs[si];
+    const len = Math.hypot(s.x2 - s.x1, s.y2 - s.y1);
+    const n = Math.floor(len / 16);
+    for (let i = 1; i <= n; i++) {
+      const t = i / n;
+      const fade = 1 - (drawn + len * t) / (total * 1.15);
+      ctx.globalAlpha = clamp(fade, 0.08, 0.9) * (si === 0 ? 1 : 0.55);
+      ctx.fillStyle = color;
+      ctx.beginPath();
+      ctx.arc(lerp(s.x1, s.x2, t), lerp(s.y1, s.y2, t), 3.2, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    drawn += len;
+  }
+  // arrowhead at end of first segment
+  const s0 = segs[0];
+  const ang = Math.atan2(s0.y2 - s0.y1, s0.x2 - s0.x1);
+  ctx.globalAlpha = 0.9;
+  ctx.translate(s0.x2, s0.y2);
+  ctx.rotate(ang);
+  ctx.fillStyle = color;
+  ctx.beginPath();
+  ctx.moveTo(10, 0); ctx.lineTo(-5, -7); ctx.lineTo(-5, 7);
+  ctx.closePath();
+  ctx.fill();
+  ctx.restore();
+}
+
+function fmtTime(t) {
+  const s = Math.max(0, Math.ceil(t));
+  return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0');
+}
+
+function drawHUD(now) {
+  const topY = safeTop + 12;
+  ctx.save();
+  ctx.textBaseline = 'alphabetic';
+  // score (timed) / targets built (zen)
+  ctx.textAlign = 'left';
+  ctx.fillStyle = 'rgba(150,160,200,0.7)';
+  ctx.font = '600 11px system-ui, sans-serif';
+  ctx.fillText(mode === 'zen' ? 'TARGETS' : 'SCORE', 16, topY + 10);
+  ctx.fillStyle = '#e8ecff';
+  ctx.shadowColor = '#22d3ee'; ctx.shadowBlur = 10;
+  ctx.font = '800 28px system-ui, sans-serif';
+  ctx.fillText(mode === 'zen' ? objectivesCompleted : Math.round(scoreShown).toLocaleString(), 16, topY + 38);
+  ctx.shadowBlur = 0;
+  // best / mode label (center)
+  ctx.textAlign = 'center';
+  ctx.fillStyle = 'rgba(150,160,200,0.55)';
+  ctx.font = '600 11px system-ui, sans-serif';
+  ctx.fillText(mode === 'zen' ? 'ZEN MODE' : 'BEST ' + best.toLocaleString(), W / 2, topY + 10);
+  zenExitRect = null;
+  if (mode === 'timed') {
+    // time
+    const urgent = timeLeft <= 10;
+    const warn = timeLeft <= 30;
+    const tColor = urgent ? '#f87171' : warn ? '#facc15' : '#22d3ee';
+    ctx.textAlign = 'right';
+    ctx.fillStyle = 'rgba(150,160,200,0.7)';
+    ctx.fillText('TIME', W - 16, topY + 10);
+    ctx.fillStyle = tColor;
+    ctx.shadowColor = tColor; ctx.shadowBlur = urgent ? 16 : 8;
+    const tPulse = urgent && state === 'play' ? 1 + 0.06 * Math.sin(now / 90) : 1;
+    ctx.font = `800 ${28 * tPulse}px system-ui, sans-serif`;
+    ctx.fillText(fmtTime(timeLeft), W - 16, topY + 38);
+    ctx.shadowBlur = 0;
+    // timer bar
+    const barY = topY + 46, barW = W - 32;
+    ctx.fillStyle = 'rgba(255,255,255,0.08)';
+    roundRect(16, barY, barW, 5, 2.5); ctx.fill();
+    const frac = clamp(timeLeft / START_TIME, 0, 1);
+    if (frac > 0) {
+      ctx.fillStyle = tColor;
+      ctx.shadowColor = tColor; ctx.shadowBlur = 6;
+      roundRect(16, barY, barW * frac, 5, 2.5); ctx.fill();
+      ctx.shadowBlur = 0;
+    }
+  } else {
+    // zen: exit button where the clock would be
+    const bw = 74, bh = 36;
+    zenExitRect = { x: W - 16 - bw, y: topY + 2, w: bw, h: bh };
+    ctx.save();
+    ctx.fillStyle = 'rgba(16,20,44,0.85)';
+    roundRect(zenExitRect.x, zenExitRect.y, bw, bh, 10); ctx.fill();
+    ctx.strokeStyle = 'rgba(139,149,201,0.55)';
+    ctx.lineWidth = 1.4;
+    roundRect(zenExitRect.x, zenExitRect.y, bw, bh, 10); ctx.stroke();
+    ctx.fillStyle = '#8b95c9';
+    ctx.font = '700 13px system-ui, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText('MENU', zenExitRect.x + bw / 2, zenExitRect.y + bh / 2 + 1);
+    ctx.restore();
+  }
+  // target panel
+  if (objective) {
+    const o = objective;
+    const x = 14, pw = W - 28, y = chipY;
+    const accent = puckColor(o.value);
+    ctx.save();
+    ctx.textBaseline = 'middle';
+    if (o.flash > 0) { ctx.shadowColor = accent; ctx.shadowBlur = 26 * o.flash; }
+    ctx.fillStyle = 'rgba(16,20,44,0.85)';
+    roundRect(x, y, pw, chipH, 14); ctx.fill();
+    ctx.strokeStyle = accent;
+    ctx.globalAlpha = 0.65 + 0.35 * (o.flash || 0);
+    ctx.lineWidth = 1.6;
+    roundRect(x, y, pw, chipH, 14); ctx.stroke();
+    ctx.globalAlpha = 1;
+    ctx.shadowBlur = 0;
+    // label + value
+    ctx.textAlign = 'left';
+    ctx.fillStyle = 'rgba(150,160,200,0.7)';
+    ctx.font = '700 10px system-ui, sans-serif';
+    ctx.fillText('TARGET', x + 16, y + 13);
+    ctx.fillStyle = accent;
+    ctx.shadowColor = accent; ctx.shadowBlur = 12;
+    ctx.font = `800 ${o.value >= 100 ? 25 : 30}px system-ui, sans-serif`;
+    ctx.fillText(o.value, x + 16, y + chipH / 2 + 9);
+    ctx.shadowBlur = 0;
+    // reward
+    ctx.textAlign = 'center';
+    ctx.fillStyle = 'rgba(220,226,255,0.9)';
+    ctx.font = '700 14px system-ui, sans-serif';
+    if (mode === 'timed') {
+      ctx.fillText('+' + o.points + ' pts', x + pw * 0.5, y + chipH * 0.32);
+      ctx.fillStyle = '#facc15';
+      ctx.font = '700 13px system-ui, sans-serif';
+      ctx.fillText('⏱ +' + o.time + 's', x + pw * 0.5, y + chipH * 0.66);
+    }
+    // next target preview
+    ctx.fillStyle = 'rgba(150,160,200,0.6)';
+    ctx.font = '600 9px system-ui, sans-serif';
+    ctx.fillText('NEXT TARGET', x + pw - 40, y + 12);
+    drawPuckAt(x + pw - 40, y + chipH / 2 + 9, 13, nextObjective.value, puckColor(nextObjective.value), 0.8);
+    ctx.restore();
+  }
+  ctx.restore();
+}
+
+function drawEffects() {
+  ctx.save();
+  ctx.globalCompositeOperation = 'lighter';
+  for (const p of particles) {
+    ctx.globalAlpha = clamp(p.life, 0, 1);
+    ctx.fillStyle = p.color;
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, p.size * p.life, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  for (const s of shockwaves) {
+    const t = 1 - s.life;
+    ctx.globalAlpha = s.life * 0.7;
+    ctx.strokeStyle = s.color;
+    ctx.lineWidth = 3 * s.life;
+    ctx.beginPath();
+    ctx.arc(s.x, s.y, lerp(s.r, s.maxR, t), 0, Math.PI * 2);
+    ctx.stroke();
+  }
+  ctx.restore();
+  ctx.save();
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  for (const f of floaters) {
+    ctx.globalAlpha = clamp(f.life, 0, 1);
+    ctx.fillStyle = f.color;
+    ctx.shadowColor = f.color;
+    ctx.shadowBlur = 8;
+    ctx.font = `800 ${f.size}px system-ui, sans-serif`;
+    ctx.fillText(f.text, f.x, f.y);
+  }
+  ctx.restore();
+}
+
+function drawMenu(now) {
+  ctx.save();
+  ctx.fillStyle = 'rgba(5,6,15,0.72)';
+  ctx.fillRect(0, 0, W, H);
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  const cy = H * 0.30;
+  // demo pucks drifting behind the title
+  const demo = [
+    { v: 2, x: W * 0.22 + Math.sin(now / 1700) * 14, y: cy - 96 + Math.cos(now / 1400) * 10 },
+    { v: 8, x: W * 0.78 + Math.sin(now / 1500 + 2) * 16, y: cy - 80 + Math.cos(now / 1800 + 1) * 12 },
+    { v: 32, x: W * 0.5 + Math.sin(now / 2000 + 4) * 20, y: cy - 130 + Math.cos(now / 1600 + 3) * 8 },
+  ];
+  for (const d of demo) drawPuckAt(d.x, d.y, puckRadius(d.v), d.v, puckColor(d.v), 0.85);
+  ctx.shadowColor = '#22d3ee';
+  ctx.shadowBlur = 24;
+  ctx.fillStyle = '#e8ecff';
+  ctx.font = `800 ${Math.min(52, W * 0.13)}px system-ui, sans-serif`;
+  ctx.fillText('SUM SHUFFLE', W / 2, cy);
+  ctx.shadowBlur = 0;
+  ctx.fillStyle = '#8b95c9';
+  ctx.font = '600 15px system-ui, sans-serif';
+  ctx.fillText('glide · collide · combine', W / 2, cy + 40);
+  ctx.font = '500 14px system-ui, sans-serif';
+  ctx.fillStyle = 'rgba(200,208,240,0.8)';
+  const lines = [
+    'Drag to aim, release to launch pucks.',
+    'Slam equal pucks together to merge their sum.',
+    'Build the TARGET number shown up top —',
+    'every target scores points and adds ⏱ time!'
+  ];
+  lines.forEach((l, i) => ctx.fillText(l, W / 2, cy + 88 + i * 24));
+  // mode buttons
+  const bw = Math.min(150, (W - 60) / 2), bh = 58, by = cy + 196;
+  menuButtons = {
+    timed: { x: W / 2 - bw - 8, y: by, w: bw, h: bh },
+    zen:   { x: W / 2 + 8,      y: by, w: bw, h: bh }
+  };
+  const pulse = 0.75 + 0.25 * Math.sin(now / 350);
+  const btns = [
+    { r: menuButtons.timed, label: 'TIMED', sub: '90s · beat the clock', color: '#22d3ee' },
+    { r: menuButtons.zen,   label: 'ZEN',   sub: 'no timer · no score',  color: '#a78bfa' }
+  ];
+  for (const b of btns) {
+    ctx.fillStyle = 'rgba(16,20,44,0.9)';
+    roundRect(b.r.x, b.r.y, b.r.w, b.r.h, 14); ctx.fill();
+    ctx.strokeStyle = b.color;
+    ctx.globalAlpha = pulse;
+    ctx.shadowColor = b.color; ctx.shadowBlur = 12;
+    ctx.lineWidth = 1.8;
+    roundRect(b.r.x, b.r.y, b.r.w, b.r.h, 14); ctx.stroke();
+    ctx.shadowBlur = 0;
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = b.color;
+    ctx.font = '800 20px system-ui, sans-serif';
+    ctx.fillText(b.label, b.r.x + b.r.w / 2, b.r.y + 24);
+    ctx.fillStyle = 'rgba(200,208,240,0.7)';
+    ctx.font = '600 11px system-ui, sans-serif';
+    ctx.fillText(b.sub, b.r.x + b.r.w / 2, b.r.y + 43);
+  }
+  if (best > 0) {
+    ctx.fillStyle = '#8b95c9';
+    ctx.font = '600 14px system-ui, sans-serif';
+    ctx.fillText('BEST  ' + best.toLocaleString(), W / 2, by + bh + 34);
+  }
+  ctx.restore();
+}
+
+function drawGameOver(now) {
+  const t = clamp((now - overAt) / 500, 0, 1);
+  ctx.save();
+  ctx.fillStyle = `rgba(5,6,15,${0.78 * t})`;
+  ctx.fillRect(0, 0, W, H);
+  ctx.globalAlpha = t;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  const cy = H * 0.32;
+  ctx.fillStyle = '#f87171';
+  ctx.shadowColor = '#f87171'; ctx.shadowBlur = 20;
+  ctx.font = '800 40px system-ui, sans-serif';
+  ctx.fillText("TIME'S UP", W / 2, cy);
+  ctx.shadowBlur = 0;
+  ctx.fillStyle = '#e8ecff';
+  ctx.shadowColor = '#22d3ee'; ctx.shadowBlur = 16;
+  ctx.font = '800 54px system-ui, sans-serif';
+  ctx.fillText(score.toLocaleString(), W / 2, cy + 74);
+  ctx.shadowBlur = 0;
+  if (score >= best && score > 0) {
+    ctx.fillStyle = '#facc15';
+    ctx.shadowColor = '#facc15'; ctx.shadowBlur = 10;
+    ctx.font = '800 18px system-ui, sans-serif';
+    ctx.fillText('★ NEW BEST ★', W / 2, cy + 116);
+    ctx.shadowBlur = 0;
+  } else {
+    ctx.fillStyle = '#8b95c9';
+    ctx.font = '600 15px system-ui, sans-serif';
+    ctx.fillText('BEST  ' + best.toLocaleString(), W / 2, cy + 116);
+  }
+  ctx.fillStyle = 'rgba(200,208,240,0.85)';
+  ctx.font = '500 15px system-ui, sans-serif';
+  ctx.fillText(`targets hit: ${objectivesCompleted}     biggest puck: ${biggestPuck || '—'}`, W / 2, cy + 158);
+  if (now - overAt > 700) {
+    ctx.globalAlpha = t * (0.6 + 0.4 * Math.sin(now / 350));
+    ctx.fillStyle = '#22d3ee';
+    ctx.shadowColor = '#22d3ee'; ctx.shadowBlur = 14;
+    ctx.font = '800 20px system-ui, sans-serif';
+    ctx.fillText('TAP TO CONTINUE', W / 2, cy + 220);
+  }
+  ctx.restore();
+}
+
+function render(now) {
+  ctx.save();
+  if (shake.t > 0 && shake.mag > 0) {
+    const m = shake.mag * clamp(shake.t / 0.25, 0, 1);
+    ctx.translate(rnd(-m, m), rnd(-m, m));
+  }
+  drawBackground(now);
+  drawBoardFrame();
+  drawTargetWatermark();
+  drawPucks();
+  if (state === 'play') {
+    drawLauncher(now);
+    drawAimGuide();
+  }
+  drawEffects();
+  if (state !== 'menu') drawHUD(now);
+  // low-time red vignette
+  if (state === 'play' && mode === 'timed' && timeLeft <= 10) {
+    const a = (0.5 + 0.5 * Math.sin(now / 120)) * 0.14 * (1 - timeLeft / 10);
+    const vg = ctx.createRadialGradient(W / 2, H / 2, H * 0.35, W / 2, H / 2, H * 0.72);
+    vg.addColorStop(0, 'rgba(248,60,60,0)');
+    vg.addColorStop(1, `rgba(248,60,60,${a})`);
+    ctx.fillStyle = vg;
+    ctx.fillRect(0, 0, W, H);
+  }
+  ctx.restore();
+  if (state === 'menu') drawMenu(now);
+  if (state === 'over') drawGameOver(now);
+}
+
+// debug/testing hooks (harmless in production)
+window.__dbg = {
+  start: startGame,
+  startZen() { mode = 'zen'; startGame(); },
+  end: endGame,
+  menu() { state = 'menu'; },
+  shoot(offAngle, power, value) {
+    const ang = -Math.PI / 2 + (offAngle || 0);
+    const p = clamp(power || 12, MIN_POWER, MAX_POWER);
+    createPuck(launcherX, launcherY, value || currentValue, Math.cos(ang) * p, Math.sin(ang) * p);
+    sfx.launch(p);
+    currentValue = nextValue; nextValue = randLaunchValue();
+  },
+  spawn(x, y, v) { return createPuck(x, y, v); },
+  clear() { for (const p of [...pucks]) removePuck(p); },
+  roll: randLaunchValue,
+  get state() { return { state, mode, score, timeLeft, pucks: pucks.map(p => ({ v: p.value, x: p.body.position.x | 0, y: p.body.position.y | 0 })), objective: objective && { v: objective.value, pts: objective.points, time: objective.time }, next: nextObjective && { v: nextObjective.value }, objectivesCompleted }; },
+  set time(t) { timeLeft = t; }
+};
+
+resize();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
