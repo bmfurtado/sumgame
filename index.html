@@ -94,7 +94,9 @@ function resize() {
   chipH = 52;
   hudH = chipY + chipH + 12;
   playTop = hudH;
-  playBottom = H - safeBottom - 10;
+  // extra bottom clearance keeps drag gestures away from the screen edge,
+  // where iOS Reachability (swipe down on the bottom edge) would trigger
+  playBottom = H - safeBottom - 30;
   playLeft = 8;
   playRight = W - 8;
   launcherX = W / 2;
@@ -222,8 +224,11 @@ try { best = +localStorage.getItem('sumshuffle_best') || 0; } catch (e) {}
 // Effects
 let particles = [], floaters = [], shockwaves = [];
 
-// Aiming
+// Aiming — two gestures share one drag: move up from the touch point to aim
+// where the finger points ('point'), or drag down to pull back like a cue
+// ('pull', shot fires opposite the drag). Mode locks once decided.
 let aiming = false, aimId = -1, aimX = 0, aimY = 0;
+let aimStartX = 0, aimStartY = 0, aimMode = null;
 
 // ---------- Pucks ----------
 function createPuck(x, y, value, vx, vy) {
@@ -434,7 +439,9 @@ function canLaunch() {
 }
 
 function aimVector() {
-  let dx = aimX - launcherX, dy = aimY - launcherY;
+  let dx, dy;
+  if (aimMode === 'pull') { dx = aimStartX - aimX; dy = aimStartY - aimY; }
+  else { dx = aimX - launcherX; dy = aimY - launcherY; }
   const d = Math.hypot(dx, dy);
   if (d < 4) return null;
   let ang = Math.atan2(dy, dx);
@@ -444,8 +451,10 @@ function aimVector() {
   while (off < -Math.PI) off += Math.PI * 2;
   off = clamp(off, -AIM_MAX_TILT, AIM_MAX_TILT);
   ang = -Math.PI / 2 + off;
-  // full power is reached when the drag spans from the launcher to about mid-screen
-  const maxDrag = Math.max(120, launcherY - H * 0.5);
+  // full power is reached when the drag spans from the launcher to about
+  // mid-screen; pull-back saturates sooner so downward drags stay short and
+  // never reach the bottom screen edge (iOS Reachability zone)
+  const maxDrag = aimMode === 'pull' ? 65 : Math.max(120, launcherY - H * 0.5);
   const power = d < 30 ? 0 : lerp(MIN_POWER, MAX_POWER, clamp((d - 30) / maxDrag, 0, 1));
   return { dx: Math.cos(ang), dy: Math.sin(ang), power };
 }
@@ -475,11 +484,17 @@ canvas.addEventListener('pointerdown', e => {
   if (mode === 'zen' && inRect(e.clientX, e.clientY, zenExitRect)) { state = 'menu'; return; }
   if (!aiming && canLaunch()) {
     aiming = true; aimId = e.pointerId;
-    aimX = e.clientX; aimY = e.clientY;
+    aimX = aimStartX = e.clientX; aimY = aimStartY = e.clientY;
+    aimMode = null;
   }
 });
 canvas.addEventListener('pointermove', e => {
-  if (aiming && e.pointerId === aimId) { aimX = e.clientX; aimY = e.clientY; }
+  if (aiming && e.pointerId === aimId) {
+    aimX = e.clientX; aimY = e.clientY;
+    if (!aimMode && Math.hypot(aimX - aimStartX, aimY - aimStartY) > 18) {
+      aimMode = aimY > aimStartY ? 'pull' : 'point';
+    }
+  }
 });
 function endAim(e, fire) {
   if (aiming && e.pointerId === aimId) {
@@ -714,7 +729,7 @@ function drawLauncher(now) {
     ctx.fillStyle = '#8b95c9';
     ctx.font = '600 13px system-ui, sans-serif';
     ctx.textAlign = 'center';
-    ctx.fillText('touch & drag to aim — release to shoot', W / 2, launcherY - 84);
+    ctx.fillText('drag up to point · drag down to pull back', W / 2, launcherY - 84);
     ctx.restore();
   }
 }
@@ -745,6 +760,18 @@ function drawAimGuide() {
   const color = puckColor(currentValue);
   ctx.shadowColor = color;
   ctx.shadowBlur = 8;
+  // cue-stick tail behind the launcher, length ∝ power
+  const frac = (v.power - MIN_POWER) / (MAX_POWER - MIN_POWER);
+  const r0 = puckRadius(currentValue) + 6;
+  const tail = lerp(14, 40, frac);
+  ctx.globalAlpha = 0.55;
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 4;
+  ctx.lineCap = 'round';
+  ctx.beginPath();
+  ctx.moveTo(launcherX - v.dx * r0, launcherY - v.dy * r0);
+  ctx.lineTo(launcherX - v.dx * (r0 + tail), launcherY - v.dy * (r0 + tail));
+  ctx.stroke();
   let drawn = 0;
   for (let si = 0; si < segs.length; si++) {
     const s = segs[si];
@@ -948,7 +975,7 @@ function drawMenu(now) {
   ctx.font = '500 14px system-ui, sans-serif';
   ctx.fillStyle = 'rgba(200,208,240,0.8)';
   const lines = [
-    'Drag to aim, release to launch pucks.',
+    'Point where to shoot, or pull back like a cue.',
     'Slam equal pucks together to merge their sum.',
     'Build the TARGET number shown up top —',
     'every target scores points and adds ⏱ time!'

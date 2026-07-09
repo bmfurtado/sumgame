@@ -4,7 +4,7 @@ A neon arcade puck-merging game for iPhone: **glide · collide · combine**.
 
 **Play it here: <https://bmfurtado.github.io/sumgame/>**
 
-Drag to aim and launch numbered pucks up the board. Pucks glide and bounce off walls and each other; when two pucks of equal value collide hard enough, they fuse into one puck worth their sum (1+1=2, 2+2=4, …). Build the single TARGET number (shown in the top panel and watermarked on the board with its recipe) to score points. A preview shows the next target so you can plan ahead, and pucks one merge away from the target pulse in its color.
+Aim with either gesture — drag upward to point where you want to shoot, or drag downward to pull back like a pool cue (the shot fires opposite your pull) — then release to launch numbered pucks up the board. Pucks glide and bounce off walls and each other; when two pucks of equal value collide hard enough, they fuse into one puck worth their sum (1+1=2, 2+2=4, …). Build the single TARGET number (shown in the top panel and watermarked on the board with its recipe) to score points. A preview shows the next target so you can plan ahead, and pucks one merge away from the target pulse in its color.
 
 The dashed launch line is a one-way barrier: pucks pass it on the way up but can never come back behind it, and shots that stall before reaching it are cleared away. Merged pucks keep some follow-through momentum, so a well-aimed shot can chain several merges in one go. The value you launch is drawn from all powers of 2 up to the biggest puck on the board, with higher values increasingly rare.
 
