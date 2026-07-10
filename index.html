@@ -54,6 +54,8 @@ const MERGE_SPEED  = 1.4;     // min relative speed for equal pucks to fuse
 const FRICTION_AIR = 0.013;   // glide decay — lower = longer, punchier glides
 const MIN_POWER    = 6, MAX_POWER = 16;
 const MERGE_CARRY  = 1.6;     // follow-through: merged pucks keep boosted momentum so they can chain into the next puck
+const REST_PUCK    = 0.62;    // puck bounciness
+const REST_WALL    = 0.5;     // wall bounciness (Matter uses max of the pair, so wall kicks effectively use REST_PUCK)
 const LAUNCH_DECAY = 0.5;     // each higher launch value is this much as likely as the one below it
 const LAUNCH_COOLDOWN = 380;  // ms between shots
 const AIM_MAX_TILT = 1.22;    // radians either side of straight up
@@ -189,14 +191,14 @@ const CAT_PUCK = 0x0001, CAT_BARRIER = 0x0002;
 function rebuildWalls() {
   for (const w of walls) Composite.remove(world, w);
   const T = 80; // thickness, centered outside the play edge
-  const opts = { isStatic: true, restitution: 0.5, friction: 0.01, label: 'wall' };
+  const opts = { isStatic: true, restitution: REST_WALL, friction: 0.01, label: 'wall' };
   walls = [
     Bodies.rectangle((playLeft + playRight) / 2, playTop - T / 2, W + T * 2, T, opts),
     Bodies.rectangle((playLeft + playRight) / 2, playBottom + T / 2, W + T * 2, T, opts),
     Bodies.rectangle(playLeft - T / 2, H / 2, T, H * 2, opts),
     Bodies.rectangle(playRight + T / 2, H / 2, T, H * 2, opts),
     Bodies.rectangle((playLeft + playRight) / 2, launchLineY + 20, playRight - playLeft, 40, {
-      isStatic: true, restitution: 0.5, friction: 0.01, label: 'launchline',
+      isStatic: true, restitution: REST_WALL, friction: 0.01, label: 'launchline',
       collisionFilter: { category: CAT_BARRIER, mask: 0xFFFFFFFF }
     }),
   ];
@@ -236,7 +238,7 @@ function createPuck(x, y, value, vx, vy) {
   const crossed = y < launchLineY;
   const body = Bodies.circle(x, y, r, {
     frictionAir: FRICTION_AIR,
-    restitution: 0.62,
+    restitution: REST_PUCK,
     friction: 0.01,
     density: 0.0015,
     label: 'puck',
@@ -543,6 +545,8 @@ function frame(now) {
           // fully cleared the launch line — it is now solid for this puck
           p.crossed = true;
           b.collisionFilter.mask = 0xFFFFFFFF;
+          // a launched puck that already IS the target counts once it's on the board
+          if (objective && p.value === objective.value) completeObjective(p);
         } else if (now - p.born > 800 && b.position.y > launchLineY && b.velocity.y > -1) {
           // still below the line and not climbing — stalled or knocked back; clear it
           burst(b.position.x, b.position.y, p.color, 10, 1.6);
@@ -755,9 +759,16 @@ function drawAimGuide() {
     if (dy < -1e-6) { const ty = (minY - py) / dy; if (ty < t) { t = ty; hitWall = 'y'; } }
     segs.push({ x1: px, y1: py, x2: px + dx * t, y2: py + dy * t });
     px += dx * t; py += dy * t; remain -= t;
-    if (hitWall === 'x') dx = -dx;
-    else if (hitWall === 'y') dy = -dy;
-    else break;
+    if (!hitWall) break;
+    // mirror the wall-normal component scaled by restitution, like the engine
+    // does (Matter uses the max restitution of the pair), so banked segments
+    // come off the wall steeper and shorter than a perfect mirror
+    const rest = Math.max(REST_PUCK, REST_WALL);
+    if (hitWall === 'x') dx = -dx * rest;
+    else dy = -dy * rest;
+    const sp = Math.hypot(dx, dy);
+    remain *= sp;
+    dx /= sp; dy /= sp;
   }
   ctx.save();
   const color = puckColor(currentValue);
