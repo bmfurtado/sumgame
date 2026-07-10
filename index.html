@@ -153,6 +153,11 @@ function noiseHit(dur, vol, freq, q, slideTo, delay) {
   s.start(t0); s.stop(t0 + dur + 0.05);
 }
 
+// haptics — no-op on iOS Safari (Vibration API unsupported there); taps work on Android
+function buzz(ms) {
+  try { if (navigator.vibrate) navigator.vibrate(ms); } catch (e) {}
+}
+
 const MERGE_NOTES = [262, 330, 392, 523, 659, 784, 1047, 1319, 1568, 2093, 2637];
 const sfx = {
   launch(p) { const k = clamp((p - MIN_POWER) / (MAX_POWER - MIN_POWER), 0, 1); noiseHit(0.22, 0.16 + 0.12 * k, 500 + 500 * k, 1.2, 1600 + 900 * k); },
@@ -174,6 +179,7 @@ const sfx = {
   objective() { [523, 659, 784, 1047].forEach((f, i) => { tone(f, 'sine', 0.22, 0.24, null, i * 0.06); tone(f, 'triangle', 0.18, 0.1, null, i * 0.06); }); },
   timeBonus() { tone(880, 'sine', 0.35, 0.24, 1760); tone(2093, 'sine', 0.15, 0.14, null, 0.12); tone(2637, 'sine', 0.18, 0.12, null, 0.2); },
   tick() { tone(1050, 'square', 0.035, 0.1); },
+  warn30() { tone(440, 'sine', 0.14, 0.22); tone(330, 'sine', 0.18, 0.2, null, 0.14); },
   gameOver() { [392, 330, 262, 196].forEach((f, i) => tone(f, 'sawtooth', 0.28, 0.14, f * 0.94, i * 0.16)); },
   start() { tone(523, 'triangle', 0.15, 0.2); tone(784, 'triangle', 0.2, 0.2, null, 0.09); }
 };
@@ -212,6 +218,7 @@ let menuButtons = null, zenExitRect = null;
 let score = 0, scoreShown = 0, best = 0;
 let timeLeft = START_TIME;
 let lastTickSecond = -1;
+let warned30 = false;          // 30s warning fired (re-arms if bonuses push time back up)
 let objective = null, nextObjective = null;   // {value, points, time, flash}
 let objectivesCompleted = 0;
 let pucks = [];                // {body, value, r, color, trail[]}
@@ -422,7 +429,7 @@ function updateEffects(dt) {
 function startGame() {
   for (const p of [...pucks]) removePuck(p);
   particles = []; floaters = []; shockwaves = []; mergeQueue.length = 0;
-  score = 0; scoreShown = 0; timeLeft = START_TIME; lastTickSecond = -1;
+  score = 0; scoreShown = 0; timeLeft = START_TIME; lastTickSecond = -1; warned30 = false;
   objectivesCompleted = 0; biggestPuck = 0;
   objective = makeObjective();
   nextObjective = makeObjective(objective.value);
@@ -587,9 +594,21 @@ function frame(now) {
     }
 
     if (mode === 'timed') {
+      const prevTime = timeLeft;
       timeLeft -= dt;
+      if (warned30 && timeLeft > 31) warned30 = false; // a bonus lifted us out of the danger zone
+      if (!warned30 && prevTime > 30 && timeLeft <= 30) {
+        warned30 = true;
+        buzz(30);
+        sfx.warn30();
+        floaters.push({ x: W - 70, y: safeTop + 44, text: '30s!', color: '#facc15', size: 20, life: 1.2, vy: -0.35 });
+      }
       const s = Math.ceil(timeLeft);
-      if (timeLeft <= 10 && s !== lastTickSecond && timeLeft > 0) { lastTickSecond = s; sfx.tick(); }
+      if (timeLeft <= 10 && s !== lastTickSecond && timeLeft > 0) {
+        lastTickSecond = s;
+        sfx.tick();
+        if (s <= 5) buzz(60);
+      }
       if (timeLeft <= 0) { timeLeft = 0; endGame(); }
     }
   }
@@ -1120,14 +1139,28 @@ function render(now) {
   }
   drawEffects();
   if (state !== 'menu') drawHUD(now);
-  // low-time red vignette
-  if (state === 'play' && mode === 'timed' && timeLeft <= 10) {
-    const a = (0.5 + 0.5 * Math.sin(now / 120)) * 0.14 * (1 - timeLeft / 10);
-    const vg = ctx.createRadialGradient(W / 2, H / 2, H * 0.35, W / 2, H / 2, H * 0.72);
+  // time-running-out glow: creeps in from 30s, breathes harder as time drains,
+  // and snaps to a once-per-second pulse (synced with the ticks) in the last 5s
+  if (state === 'play' && mode === 'timed' && timeLeft <= 30 && timeLeft > 0) {
+    const u = clamp((30 - timeLeft) / 25, 0, 1); // 0 at 30s → 1 at 5s
+    let a;
+    if (timeLeft <= 5) {
+      // bright at each second boundary, decaying within the second
+      a = 0.12 + 0.3 * Math.pow(clamp(timeLeft % 1, 0, 1), 1.5);
+    } else {
+      const breathe = 0.5 + 0.5 * Math.sin(now / 260);
+      a = 0.05 + 0.2 * u * breathe;
+    }
+    const vg = ctx.createRadialGradient(W / 2, H / 2, H * 0.22, W / 2, H / 2, H * 0.75);
     vg.addColorStop(0, 'rgba(248,60,60,0)');
     vg.addColorStop(1, `rgba(248,60,60,${a})`);
     ctx.fillStyle = vg;
     ctx.fillRect(0, 0, W, H);
+    if (timeLeft <= 10) {
+      // faint full-screen wash on top for the final stretch
+      ctx.fillStyle = `rgba(248,40,40,${a * 0.3})`;
+      ctx.fillRect(0, 0, W, H);
+    }
   }
   ctx.restore();
   if (state === 'menu') drawMenu(now);
