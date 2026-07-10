@@ -50,7 +50,7 @@ const { Engine, Bodies, Body, Composite, Events, Vector } = Matter;
 // ---------- Tunables ----------
 const START_TIME   = 90;      // seconds per round
 const OBJ_TIME = { 4: 4, 8: 6, 16: 9, 32: 12, 64: 15, 128: 18, 256: 22, 512: 26 }; // seconds granted per completed target
-const MERGE_SPEED  = 1.4;     // min relative speed for equal pucks to fuse
+const MERGE_SPEED  = 1.1;     // min relative speed for equal pucks to fuse
 const FRICTION_AIR = 0.013;   // glide decay — lower = longer, punchier glides
 const MIN_POWER    = 6, MAX_POWER = 16;
 const MERGE_CARRY  = 1.6;     // follow-through: merged pucks keep boosted momentum so they can chain into the next puck
@@ -325,23 +325,34 @@ function completeObjective(puck) {
 const mergeQueue = [];
 const mergedIds = new Set();
 
+function tryMerge(a, b) {
+  const pa = a.plugin && a.plugin.puck, pb = b.plugin && b.plugin.puck;
+  if (!pa || !pb || pa.value !== pb.value) return;
+  if (mergedIds.has(a.id) || mergedIds.has(b.id)) return;
+  // merges only happen on the board proper — the launch zone is inert
+  if (a.position.y >= launchLineY || b.position.y >= launchLineY) return;
+  const rel = Vector.magnitude(Vector.sub(a.velocity, b.velocity));
+  if (rel >= MERGE_SPEED) {
+    mergedIds.add(a.id); mergedIds.add(b.id);
+    mergeQueue.push([pa, pb]);
+  }
+}
+
 Events.on(engine, 'collisionStart', ev => {
   for (const pair of ev.pairs) {
     const a = pair.bodyA, b = pair.bodyB;
     const pa = a.plugin && a.plugin.puck, pb = b.plugin && b.plugin.puck;
     const rel = Vector.magnitude(Vector.sub(a.velocity, b.velocity));
-    if (pa && pb) {
-      if (rel > 0.8) sfx.hit(rel / 9);
-      // merges only happen on the board proper — the launch zone is inert
-      const onBoard = a.position.y < launchLineY && b.position.y < launchLineY;
-      if (onBoard && pa.value === pb.value && rel >= MERGE_SPEED && !mergedIds.has(a.id) && !mergedIds.has(b.id)) {
-        mergedIds.add(a.id); mergedIds.add(b.id);
-        mergeQueue.push([pa, pb]);
-      }
-    } else if (pa || pb) {
-      if (rel > 1.2) sfx.hit(rel / 14);
-    }
+    if (pa && pb) { if (rel > 0.8) sfx.hit(rel / 9); }
+    else if (pa || pb) { if (rel > 1.2) sfx.hit(rel / 14); }
+    tryMerge(a, b);
   }
+});
+
+// pucks already resting in contact never re-fire collisionStart, so an
+// indirect shove that presses them together is checked here instead
+Events.on(engine, 'collisionActive', ev => {
+  for (const pair of ev.pairs) tryMerge(pair.bodyA, pair.bodyB);
 });
 
 function processMerges() {
