@@ -492,7 +492,10 @@ canvas.addEventListener('pointermove', e => {
   if (aiming && e.pointerId === aimId) {
     aimX = e.clientX; aimY = e.clientY;
     if (!aimMode && Math.hypot(aimX - aimStartX, aimY - aimStartY) > 18) {
-      aimMode = aimY > aimStartY ? 'pull' : 'point';
+      // pull-back only arms for drags starting in (or just above) the launch
+      // zone; drags starting further up the board always point-aim
+      const canPull = aimStartY > launchLineY - 30;
+      aimMode = canPull && aimY > aimStartY ? 'pull' : 'point';
     }
   }
 });
@@ -729,7 +732,7 @@ function drawLauncher(now) {
     ctx.fillStyle = '#8b95c9';
     ctx.font = '600 13px system-ui, sans-serif';
     ctx.textAlign = 'center';
-    ctx.fillText('drag up to point · drag down to pull back', W / 2, launcherY - 84);
+    ctx.fillText('drag to aim · pull back from the pad for a cue shot', W / 2, launcherY - 84);
     ctx.restore();
   }
 }
