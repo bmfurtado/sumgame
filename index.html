@@ -197,11 +197,7 @@ function rebuildWalls() {
     Bodies.rectangle((playLeft + playRight) / 2, playBottom + T / 2, W + T * 2, T, opts),
     Bodies.rectangle(playLeft - T / 2, H / 2, T, H * 2, opts),
     Bodies.rectangle(playRight + T / 2, H / 2, T, H * 2, opts),
-    // top edge sits 22px below the drawn line, so a puck turning solid the
-    // moment its center crosses the line has no residual overlap to eject
-    // (no phantom push on slow launches); pushed-back pucks stop with their
-    // center at most a few px past the line
-    Bodies.rectangle((playLeft + playRight) / 2, launchLineY + 42, playRight - playLeft, 40, {
+    Bodies.rectangle((playLeft + playRight) / 2, launchLineY + 20, playRight - playLeft, 40, {
       isStatic: true, restitution: REST_WALL, friction: 0.01, label: 'launchline',
       collisionFilter: { category: CAT_BARRIER, mask: 0xFFFFFFFF }
     }),
@@ -239,7 +235,11 @@ let aimStartX = 0, aimStartY = 0, aimMode = null;
 // ---------- Pucks ----------
 function createPuck(x, y, value, vx, vy) {
   const r = puckRadius(value);
+  // pucks born on the board (starters, merge results — possibly straddling
+  // the line) are solid immediately; launched pucks start below and only
+  // turn solid once they fully clear the line
   const crossed = y < launchLineY;
+  const bornAt = simTime;
   const body = Bodies.circle(x, y, r, {
     frictionAir: FRICTION_AIR,
     restitution: REST_PUCK,
@@ -248,7 +248,7 @@ function createPuck(x, y, value, vx, vy) {
     label: 'puck',
     collisionFilter: { category: CAT_PUCK, mask: crossed ? 0xFFFFFFFF : (0xFFFFFFFF ^ CAT_BARRIER) }
   });
-  const p = { body, value, r, color: puckColor(value), trail: [], born: performance.now(), crossed };
+  const p = { body, value, r, color: puckColor(value), trail: [], born: bornAt, crossed };
   body.plugin.puck = p;
   Body.setVelocity(body, { x: vx || 0, y: vy || 0 });
   Composite.add(world, body);
@@ -334,8 +334,7 @@ function tryMerge(a, b) {
   if (!pa || !pb || pa.value !== pb.value) return;
   if (mergedIds.has(a.id) || mergedIds.has(b.id)) return;
   // merges only happen on the board proper — the launch zone is inert
-  // (+12px tolerance for pucks resting with their center just past the line)
-  if (a.position.y >= launchLineY + 12 || b.position.y >= launchLineY + 12) return;
+  if (a.position.y >= launchLineY || b.position.y >= launchLineY) return;
   const rel = Vector.magnitude(Vector.sub(a.velocity, b.velocity));
   if (rel >= MERGE_SPEED) {
     mergedIds.add(a.id); mergedIds.add(b.id);
@@ -532,7 +531,39 @@ document.addEventListener('gesturestart', e => e.preventDefault());
 
 // ---------- Main loop ----------
 let lastT = performance.now(), acc = 0;
+let simTime = 0; // simulated clock, advances with physics steps
 const STEP = 1000 / 60;
+
+// per-physics-step puck maintenance (escape cleanup, line crossing, bad launches)
+function stepPucks() {
+  for (let i = pucks.length - 1; i >= 0; i--) {
+    const p = pucks[i];
+    const b = p.body;
+    if (b.position.x < -80 || b.position.x > W + 80 || b.position.y < -80 || b.position.y > H + 80) { removePuck(p); continue; }
+    if (!p.crossed) {
+      if (b.position.y < launchLineY - p.r) {
+        // fully cleared the launch line — the barrier is now solid for this
+        // puck, with zero overlap to resolve (no phantom push)
+        p.crossed = true;
+        b.collisionFilter.mask = 0xFFFFFFFF;
+        // a launched puck that already IS the target counts once it's on the board
+        if (objective && p.value === objective.value) completeObjective(p);
+      } else if (simTime - p.born > 800 && b.velocity.y > -1) {
+        // stalled without fully clearing the line — a bad launch; clear it
+        burst(b.position.x, b.position.y, p.color, 10, 1.6);
+        floaters.push({ x: b.position.x, y: b.position.y, text: 'SHORT', color: 'rgba(150,160,200,0.9)', size: 13, life: 0.8, vy: -0.5 });
+        removePuck(p);
+      }
+    }
+  }
+}
+
+function stepPhysics() {
+  Engine.update(engine, STEP);
+  simTime += STEP;
+  processMerges();
+  stepPucks();
+}
 
 function frame(now) {
   requestAnimationFrame(frame);
@@ -544,34 +575,15 @@ function frame(now) {
     acc += dtMs;
     let steps = 0;
     while (acc >= STEP && steps < 4) {
-      Engine.update(engine, STEP);
-      processMerges();
+      stepPhysics();
       acc -= STEP; steps++;
     }
     if (steps === 4) acc = 0;
 
-    // trails + cleanup of escapees
-    for (let i = pucks.length - 1; i >= 0; i--) {
-      const p = pucks[i];
-      const b = p.body;
-      p.trail.push({ x: b.position.x, y: b.position.y });
+    // trails (visual only)
+    for (const p of pucks) {
+      p.trail.push({ x: p.body.position.x, y: p.body.position.y });
       if (p.trail.length > 8) p.trail.shift();
-      if (b.position.x < -80 || b.position.x > W + 80 || b.position.y < -80 || b.position.y > H + 80) { removePuck(p); continue; }
-      if (!p.crossed) {
-        if (b.position.y < launchLineY) {
-          // center crossed the launch line — the barrier is now solid for this
-          // puck (any residual overlap is eased out upward by the solver)
-          p.crossed = true;
-          b.collisionFilter.mask = 0xFFFFFFFF;
-          // a launched puck that already IS the target counts once it's on the board
-          if (objective && p.value === objective.value) completeObjective(p);
-        } else if (now - p.born > 800 && b.position.y > launchLineY && b.velocity.y > -1) {
-          // still below the line and not climbing — stalled or knocked back; clear it
-          burst(b.position.x, b.position.y, p.color, 10, 1.6);
-          floaters.push({ x: b.position.x, y: b.position.y, text: 'SHORT', color: 'rgba(150,160,200,0.9)', size: 13, life: 0.8, vy: -0.5 });
-          removePuck(p);
-        }
-      }
     }
 
     if (mode === 'timed') {
@@ -1138,6 +1150,7 @@ window.__dbg = {
   spawn(x, y, v, vx, vy) { return createPuck(x, y, v, vx, vy); },
   clear() { for (const p of [...pucks]) removePuck(p); },
   roll: randLaunchValue,
+  step(ticks) { for (let i = 0; i < (ticks || 1); i++) stepPhysics(); },
   get state() { return { state, mode, score, timeLeft, pucks: pucks.map(p => ({ v: p.value, x: p.body.position.x | 0, y: p.body.position.y | 0 })), objective: objective && { v: objective.value, pts: objective.points, time: objective.time }, next: nextObjective && { v: nextObjective.value }, objectivesCompleted }; },
   set time(t) { timeLeft = t; }
 };
