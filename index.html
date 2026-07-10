@@ -184,8 +184,8 @@ engine.gravity.x = 0; engine.gravity.y = 0;
 const world = engine.world;
 let walls = [];
 
-// collision categories: the launch line is a one-way barrier — pucks ignore
-// it until they have fully crossed above it, then it becomes solid for them
+// collision categories: the launch line barrier is intangible to each puck
+// until that puck's center crosses the line, then it turns solid for it
 const CAT_PUCK = 0x0001, CAT_BARRIER = 0x0002;
 
 function rebuildWalls() {
@@ -354,6 +354,7 @@ Events.on(engine, 'collisionStart', ev => {
 Events.on(engine, 'collisionActive', ev => {
   for (const pair of ev.pairs) tryMerge(pair.bodyA, pair.bodyB);
 });
+
 
 function processMerges() {
   while (mergeQueue.length) {
@@ -552,8 +553,9 @@ function frame(now) {
       if (p.trail.length > 8) p.trail.shift();
       if (b.position.x < -80 || b.position.x > W + 80 || b.position.y < -80 || b.position.y > H + 80) { removePuck(p); continue; }
       if (!p.crossed) {
-        if (b.position.y < launchLineY - p.r) {
-          // fully cleared the launch line — it is now solid for this puck
+        if (b.position.y < launchLineY) {
+          // center crossed the launch line — the barrier is now solid for this
+          // puck (any residual overlap is eased out upward by the solver)
           p.crossed = true;
           b.collisionFilter.mask = 0xFFFFFFFF;
           // a launched puck that already IS the target counts once it's on the board
@@ -1128,7 +1130,7 @@ window.__dbg = {
     sfx.launch(p);
     currentValue = nextValue; nextValue = randLaunchValue();
   },
-  spawn(x, y, v) { return createPuck(x, y, v); },
+  spawn(x, y, v, vx, vy) { return createPuck(x, y, v, vx, vy); },
   clear() { for (const p of [...pucks]) removePuck(p); },
   roll: randLaunchValue,
   get state() { return { state, mode, score, timeLeft, pucks: pucks.map(p => ({ v: p.value, x: p.body.position.x | 0, y: p.body.position.y | 0 })), objective: objective && { v: objective.value, pts: objective.points, time: objective.time }, next: nextObjective && { v: nextObjective.value }, objectivesCompleted }; },
