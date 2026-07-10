@@ -197,7 +197,11 @@ function rebuildWalls() {
     Bodies.rectangle((playLeft + playRight) / 2, playBottom + T / 2, W + T * 2, T, opts),
     Bodies.rectangle(playLeft - T / 2, H / 2, T, H * 2, opts),
     Bodies.rectangle(playRight + T / 2, H / 2, T, H * 2, opts),
-    Bodies.rectangle((playLeft + playRight) / 2, launchLineY + 20, playRight - playLeft, 40, {
+    // top edge sits 22px below the drawn line, so a puck turning solid the
+    // moment its center crosses the line has no residual overlap to eject
+    // (no phantom push on slow launches); pushed-back pucks stop with their
+    // center at most a few px past the line
+    Bodies.rectangle((playLeft + playRight) / 2, launchLineY + 42, playRight - playLeft, 40, {
       isStatic: true, restitution: REST_WALL, friction: 0.01, label: 'launchline',
       collisionFilter: { category: CAT_BARRIER, mask: 0xFFFFFFFF }
     }),
@@ -330,7 +334,8 @@ function tryMerge(a, b) {
   if (!pa || !pb || pa.value !== pb.value) return;
   if (mergedIds.has(a.id) || mergedIds.has(b.id)) return;
   // merges only happen on the board proper — the launch zone is inert
-  if (a.position.y >= launchLineY || b.position.y >= launchLineY) return;
+  // (+12px tolerance for pucks resting with their center just past the line)
+  if (a.position.y >= launchLineY + 12 || b.position.y >= launchLineY + 12) return;
   const rel = Vector.magnitude(Vector.sub(a.velocity, b.velocity));
   if (rel >= MERGE_SPEED) {
     mergedIds.add(a.id); mergedIds.add(b.id);
