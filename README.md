@@ -10,8 +10,10 @@ The dashed launch line is a one-way barrier: pucks pass it on the way up but can
 
 Two modes:
 
-- **Timed** — 90 seconds on the clock; every completed target scores points and adds bonus seconds scaled to its difficulty. Best score is saved.
+- **Timed** — 90 seconds on the clock; every completed target scores points and adds bonus seconds scaled to its difficulty. Best score is saved. The ❚❚ button at the top pauses the round (it also auto-pauses if the app goes to the background).
 - **Zen** — no timer, no score. Just build targets at your own pace (the HUD counts how many); the MENU button in the top-right returns to the title screen.
+
+Sound can be toggled from the title screen or the pause screen; the setting persists between sessions.
 
 ## Running locally
 

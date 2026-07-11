@@ -110,13 +110,21 @@ window.addEventListener('resize', resize);
 
 // ---------- Audio (all sounds synthesized) ----------
 let AC = null, master = null, noiseBuf = null, lastHitSound = 0;
+let soundOn = true;
+try { soundOn = localStorage.getItem('sumshuffle_sound') !== '0'; } catch (e) {}
+
+function setSound(on) {
+  soundOn = on;
+  try { localStorage.setItem('sumshuffle_sound', on ? '1' : '0'); } catch (e) {}
+  if (master) master.gain.value = on ? 0.5 : 0;
+}
 
 function initAudio() {
   if (AC) { if (AC.state === 'suspended') AC.resume(); return; }
   try {
     AC = new (window.AudioContext || window.webkitAudioContext)();
     master = AC.createGain();
-    master.gain.value = 0.5;
+    master.gain.value = soundOn ? 0.5 : 0;
     master.connect(AC.destination);
     const len = AC.sampleRate;
     noiseBuf = AC.createBuffer(1, len, AC.sampleRate);
@@ -212,9 +220,10 @@ function rebuildWalls() {
 }
 
 // ---------- Game state ----------
-let state = 'menu';            // menu | play | over
+let state = 'menu';            // menu | play | paused | over
 let mode = 'timed';            // timed | zen
 let menuButtons = null, zenExitRect = null;
+let menuSoundRect = null, pauseRect = null, pausedButtons = null;
 let score = 0, scoreShown = 0, best = 0;
 let timeLeft = START_TIME;
 let lastTickSecond = -1;
@@ -497,16 +506,34 @@ function launch() {
 
 const inRect = (px, py, r) => r && px >= r.x && px <= r.x + r.w && py >= r.y && py <= r.y + r.h;
 
+function pauseGame() {
+  if (state === 'play' && mode === 'timed') {
+    state = 'paused';
+    aiming = false;
+  }
+}
+// auto-pause when the app goes to the background mid-round
+document.addEventListener('visibilitychange', () => { if (document.hidden) pauseGame(); });
+
 canvas.addEventListener('pointerdown', e => {
   e.preventDefault();
   initAudio();
   if (state === 'menu') {
     if (inRect(e.clientX, e.clientY, menuButtons && menuButtons.timed)) { mode = 'timed'; startGame(); }
     else if (inRect(e.clientX, e.clientY, menuButtons && menuButtons.zen)) { mode = 'zen'; startGame(); }
+    else if (inRect(e.clientX, e.clientY, menuSoundRect)) { setSound(!soundOn); if (soundOn) sfx.tick(); }
+    return;
+  }
+  if (state === 'paused') {
+    const b = pausedButtons;
+    if (inRect(e.clientX, e.clientY, b && b.resume)) state = 'play';
+    else if (inRect(e.clientX, e.clientY, b && b.sound)) { setSound(!soundOn); if (soundOn) sfx.tick(); }
+    else if (inRect(e.clientX, e.clientY, b && b.exit)) state = 'menu';
     return;
   }
   if (state === 'over') { if (performance.now() - overAt > 700) state = 'menu'; return; }
   if (mode === 'zen' && inRect(e.clientX, e.clientY, zenExitRect)) { state = 'menu'; return; }
+  if (mode === 'timed' && inRect(e.clientX, e.clientY, pauseRect)) { pauseGame(); return; }
   if (!aiming && canLaunch()) {
     aiming = true; aimId = e.pointerId;
     aimX = aimStartX = e.clientX; aimY = aimStartY = e.clientY;
@@ -889,8 +916,22 @@ function drawHUD(now) {
   ctx.fillStyle = 'rgba(150,160,200,0.55)';
   ctx.font = '600 11px system-ui, sans-serif';
   ctx.fillText(mode === 'zen' ? 'ZEN MODE' : 'BEST ' + best.toLocaleString(), W / 2, topY + 10);
-  zenExitRect = null;
+  zenExitRect = null; pauseRect = null;
   if (mode === 'timed') {
+    // pause button (under the BEST label)
+    const pw2 = 46, ph2 = 26;
+    pauseRect = { x: W / 2 - pw2 / 2, y: topY + 16, w: pw2, h: ph2 };
+    ctx.save();
+    ctx.fillStyle = 'rgba(16,20,44,0.85)';
+    roundRect(pauseRect.x, pauseRect.y, pw2, ph2, 8); ctx.fill();
+    ctx.strokeStyle = 'rgba(139,149,201,0.45)';
+    ctx.lineWidth = 1.2;
+    roundRect(pauseRect.x, pauseRect.y, pw2, ph2, 8); ctx.stroke();
+    ctx.fillStyle = '#8b95c9';
+    const pcx = pauseRect.x + pw2 / 2, pcy = pauseRect.y + ph2 / 2;
+    ctx.fillRect(pcx - 5, pcy - 5, 3.5, 10);
+    ctx.fillRect(pcx + 1.5, pcy - 5, 3.5, 10);
+    ctx.restore();
     // time
     const urgent = timeLeft <= 10;
     const warn = timeLeft <= 30;
@@ -1077,6 +1118,17 @@ function drawMenu(now) {
     ctx.font = '600 14px system-ui, sans-serif';
     ctx.fillText('BEST  ' + best.toLocaleString(), W / 2, by + bh + 34);
   }
+  // sound toggle
+  const sw = 148, sh = 36, sy = by + bh + (best > 0 ? 56 : 26);
+  menuSoundRect = { x: W / 2 - sw / 2, y: sy, w: sw, h: sh };
+  ctx.fillStyle = 'rgba(16,20,44,0.9)';
+  roundRect(menuSoundRect.x, sy, sw, sh, 10); ctx.fill();
+  ctx.strokeStyle = soundOn ? 'rgba(139,149,201,0.55)' : 'rgba(139,149,201,0.3)';
+  ctx.lineWidth = 1.4;
+  roundRect(menuSoundRect.x, sy, sw, sh, 10); ctx.stroke();
+  ctx.fillStyle = soundOn ? '#8b95c9' : 'rgba(139,149,201,0.55)';
+  ctx.font = '700 13px system-ui, sans-serif';
+  ctx.fillText(soundOn ? '🔊 SOUND ON' : '🔇 SOUND OFF', W / 2, sy + sh / 2);
   ctx.restore();
 }
 
@@ -1164,7 +1216,48 @@ function render(now) {
   }
   ctx.restore();
   if (state === 'menu') drawMenu(now);
+  if (state === 'paused') drawPaused(now);
   if (state === 'over') drawGameOver(now);
+}
+
+function drawPaused(now) {
+  ctx.save();
+  ctx.fillStyle = 'rgba(5,6,15,0.78)';
+  ctx.fillRect(0, 0, W, H);
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  const cy = H * 0.3;
+  ctx.fillStyle = '#22d3ee';
+  ctx.shadowColor = '#22d3ee'; ctx.shadowBlur = 18;
+  ctx.font = '800 38px system-ui, sans-serif';
+  ctx.fillText('PAUSED', W / 2, cy);
+  ctx.shadowBlur = 0;
+  const bw = Math.min(230, W - 120), bh = 52, bx = W / 2 - bw / 2;
+  pausedButtons = {
+    resume: { x: bx, y: cy + 60, w: bw, h: bh },
+    sound:  { x: bx, y: cy + 128, w: bw, h: bh },
+    exit:   { x: bx, y: cy + 196, w: bw, h: bh }
+  };
+  const btns = [
+    { r: pausedButtons.resume, label: 'RESUME', color: '#22d3ee', glow: true },
+    { r: pausedButtons.sound, label: soundOn ? '🔊 SOUND ON' : '🔇 SOUND OFF', color: '#a78bfa' },
+    { r: pausedButtons.exit, label: 'EXIT TO MENU', color: '#8b95c9' }
+  ];
+  for (const b of btns) {
+    ctx.fillStyle = 'rgba(16,20,44,0.92)';
+    roundRect(b.r.x, b.r.y, b.r.w, b.r.h, 14); ctx.fill();
+    ctx.strokeStyle = b.color;
+    ctx.globalAlpha = b.glow ? 0.75 + 0.25 * Math.sin(now / 350) : 0.55;
+    if (b.glow) { ctx.shadowColor = b.color; ctx.shadowBlur = 12; }
+    ctx.lineWidth = 1.8;
+    roundRect(b.r.x, b.r.y, b.r.w, b.r.h, 14); ctx.stroke();
+    ctx.shadowBlur = 0;
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = b.color;
+    ctx.font = '800 17px system-ui, sans-serif';
+    ctx.fillText(b.label, b.r.x + b.r.w / 2, b.r.y + b.r.h / 2 + 1);
+  }
+  ctx.restore();
 }
 
 // debug/testing hooks (harmless in production)
