@@ -222,7 +222,7 @@ function rebuildWalls() {
 // ---------- Game state ----------
 let state = 'menu';            // menu | play | paused | over
 let mode = 'timed';            // timed | zen
-let menuButtons = null, zenExitRect = null;
+let menuButtons = null;
 let menuSoundRect = null, pauseRect = null, pausedButtons = null;
 let score = 0, scoreShown = 0, best = 0;
 let timeLeft = START_TIME;
@@ -507,7 +507,7 @@ function launch() {
 const inRect = (px, py, r) => r && px >= r.x && px <= r.x + r.w && py >= r.y && py <= r.y + r.h;
 
 function pauseGame() {
-  if (state === 'play' && mode === 'timed') {
+  if (state === 'play') {
     state = 'paused';
     aiming = false;
   }
@@ -532,8 +532,7 @@ canvas.addEventListener('pointerdown', e => {
     return;
   }
   if (state === 'over') { if (performance.now() - overAt > 700) state = 'menu'; return; }
-  if (mode === 'zen' && inRect(e.clientX, e.clientY, zenExitRect)) { state = 'menu'; return; }
-  if (mode === 'timed' && inRect(e.clientX, e.clientY, pauseRect)) { pauseGame(); return; }
+  if (inRect(e.clientX, e.clientY, pauseRect)) { pauseGame(); return; }
   if (!aiming && canLaunch()) {
     aiming = true; aimId = e.pointerId;
     aimX = aimStartX = e.clientX; aimY = aimStartY = e.clientY;
@@ -916,22 +915,21 @@ function drawHUD(now) {
   ctx.fillStyle = 'rgba(150,160,200,0.55)';
   ctx.font = '600 11px system-ui, sans-serif';
   ctx.fillText(mode === 'zen' ? 'ZEN MODE' : 'BEST ' + best.toLocaleString(), W / 2, topY + 10);
-  zenExitRect = null; pauseRect = null;
+  // pause/menu button (under the center label, both modes)
+  const pw2 = 46, ph2 = 26;
+  pauseRect = { x: W / 2 - pw2 / 2, y: topY + 16, w: pw2, h: ph2 };
+  ctx.save();
+  ctx.fillStyle = 'rgba(16,20,44,0.85)';
+  roundRect(pauseRect.x, pauseRect.y, pw2, ph2, 8); ctx.fill();
+  ctx.strokeStyle = 'rgba(139,149,201,0.45)';
+  ctx.lineWidth = 1.2;
+  roundRect(pauseRect.x, pauseRect.y, pw2, ph2, 8); ctx.stroke();
+  ctx.fillStyle = '#8b95c9';
+  const pcx = pauseRect.x + pw2 / 2, pcy = pauseRect.y + ph2 / 2;
+  ctx.fillRect(pcx - 5, pcy - 5, 3.5, 10);
+  ctx.fillRect(pcx + 1.5, pcy - 5, 3.5, 10);
+  ctx.restore();
   if (mode === 'timed') {
-    // pause button (under the BEST label)
-    const pw2 = 46, ph2 = 26;
-    pauseRect = { x: W / 2 - pw2 / 2, y: topY + 16, w: pw2, h: ph2 };
-    ctx.save();
-    ctx.fillStyle = 'rgba(16,20,44,0.85)';
-    roundRect(pauseRect.x, pauseRect.y, pw2, ph2, 8); ctx.fill();
-    ctx.strokeStyle = 'rgba(139,149,201,0.45)';
-    ctx.lineWidth = 1.2;
-    roundRect(pauseRect.x, pauseRect.y, pw2, ph2, 8); ctx.stroke();
-    ctx.fillStyle = '#8b95c9';
-    const pcx = pauseRect.x + pw2 / 2, pcy = pauseRect.y + ph2 / 2;
-    ctx.fillRect(pcx - 5, pcy - 5, 3.5, 10);
-    ctx.fillRect(pcx + 1.5, pcy - 5, 3.5, 10);
-    ctx.restore();
     // time
     const urgent = timeLeft <= 10;
     const warn = timeLeft <= 30;
@@ -956,22 +954,6 @@ function drawHUD(now) {
       roundRect(16, barY, barW * frac, 5, 2.5); ctx.fill();
       ctx.shadowBlur = 0;
     }
-  } else {
-    // zen: exit button where the clock would be
-    const bw = 74, bh = 36;
-    zenExitRect = { x: W - 16 - bw, y: topY + 2, w: bw, h: bh };
-    ctx.save();
-    ctx.fillStyle = 'rgba(16,20,44,0.85)';
-    roundRect(zenExitRect.x, zenExitRect.y, bw, bh, 10); ctx.fill();
-    ctx.strokeStyle = 'rgba(139,149,201,0.55)';
-    ctx.lineWidth = 1.4;
-    roundRect(zenExitRect.x, zenExitRect.y, bw, bh, 10); ctx.stroke();
-    ctx.fillStyle = '#8b95c9';
-    ctx.font = '700 13px system-ui, sans-serif';
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'middle';
-    ctx.fillText('MENU', zenExitRect.x + bw / 2, zenExitRect.y + bh / 2 + 1);
-    ctx.restore();
   }
   // target panel
   if (objective) {
