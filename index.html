@@ -526,9 +526,9 @@ canvas.addEventListener('pointerdown', e => {
   }
   if (state === 'paused') {
     const b = pausedButtons;
-    if (inRect(e.clientX, e.clientY, b && b.resume)) state = 'play';
-    else if (inRect(e.clientX, e.clientY, b && b.sound)) { setSound(!soundOn); if (soundOn) sfx.tick(); }
+    if (inRect(e.clientX, e.clientY, b && b.sound)) { setSound(!soundOn); if (soundOn) sfx.tick(); }
     else if (inRect(e.clientX, e.clientY, b && b.exit)) state = 'menu';
+    else state = 'play'; // resume button — or any tap outside the buttons
     return;
   }
   if (state === 'over') { if (performance.now() - overAt > 700) state = 'menu'; return; }
