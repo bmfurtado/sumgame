@@ -86,7 +86,7 @@ function readSafeArea() {
 
 function resize() {
   readSafeArea();
-  DPR = Math.min(window.devicePixelRatio || 1, 3);
+  DPR = lowGfx ? 1 : Math.min(window.devicePixelRatio || 1, 3);
   W = window.innerWidth; H = window.innerHeight;
   canvas.width = Math.round(W * DPR);
   canvas.height = Math.round(H * DPR);
@@ -107,6 +107,29 @@ function resize() {
   rebuildWalls();
 }
 window.addEventListener('resize', resize);
+
+// ---------- Graphics quality ----------
+// Firefox on Android chokes on canvas shadow blur and per-frame gradients, so
+// it defaults to the cheap renderer; the choice is persisted once toggled
+const IS_FIREFOX_ANDROID = /Android/i.test(navigator.userAgent) && /Firefox\//i.test(navigator.userAgent);
+let lowGfx = IS_FIREFOX_ANDROID;
+try {
+  const v = localStorage.getItem('sumshuffle_lowgfx');
+  if (v !== null) lowGfx = v === '1';
+} catch (e) {}
+
+function setLowGfx(on) {
+  lowGfx = on;
+  try { localStorage.setItem('sumshuffle_lowgfx', on ? '1' : '0'); } catch (e) {}
+  resize(); // re-applies the DPR cap
+}
+
+// neon glow is the single most expensive canvas feature on weak GPUs
+function glow(color, blur) {
+  if (lowGfx) return;
+  ctx.shadowColor = color;
+  ctx.shadowBlur = blur;
+}
 
 // ---------- Audio (all sounds synthesized) ----------
 let AC = null, master = null, noiseBuf = null, lastHitSound = 0;
@@ -223,12 +246,13 @@ function rebuildWalls() {
 let state = 'menu';            // menu | play | paused | over
 let mode = 'timed';            // timed | zen
 let menuButtons = null;
-let menuSoundRect = null, pauseRect = null, pausedButtons = null;
+let menuSoundRect = null, menuGfxRect = null, pauseRect = null, pausedButtons = null;
 let score = 0, scoreShown = 0, best = 0;
 let timeLeft = START_TIME;
 let lastTickSecond = -1;
 let warned30 = false;          // 30s warning fired (re-arms if bonuses push time back up)
 let objective = null, nextObjective = null;   // {value, points, time, flash}
+let pendingTargetCheck = 0;    // simTime deadline for the delayed fresh-target re-check
 let objectivesCompleted = 0;
 let pucks = [];                // {body, value, r, color, trail[]}
 let currentValue = 1, nextValue = 2;
@@ -333,12 +357,9 @@ function completeObjective(puck) {
   objective = nextObjective;
   objective.flash = 1;
   nextObjective = makeObjective(objective.value);
-  // a puck built earlier may already match the fresh target — cash it in
-  setTimeout(() => {
-    if (state !== 'play') return;
-    const hit = pucks.find(p => p.value === objective.value);
-    if (hit) completeObjective(hit);
-  }, 450);
+  // a puck built earlier may already match the fresh target — cash it in after
+  // a beat, on the sim clock so the delay scales with any slowdown
+  pendingTargetCheck = simTime + 450;
 }
 
 // ---------- Merging ----------
@@ -402,6 +423,7 @@ function processMerges() {
 
 // ---------- Effects ----------
 function burst(x, y, color, n, speed) {
+  if (lowGfx) n = Math.ceil(n * 0.4);
   for (let i = 0; i < n; i++) {
     const a = Math.random() * Math.PI * 2;
     const s = rnd(0.3, 1) * speed;
@@ -440,6 +462,7 @@ function startGame() {
   particles = []; floaters = []; shockwaves = []; mergeQueue.length = 0;
   score = 0; scoreShown = 0; timeLeft = START_TIME; lastTickSecond = -1; warned30 = false;
   objectivesCompleted = 0; biggestPuck = 0;
+  pendingTargetCheck = 0;
   objective = makeObjective();
   nextObjective = makeObjective(objective.value);
   currentValue = randLaunchValue(); nextValue = randLaunchValue();
@@ -469,7 +492,7 @@ function endGame() {
 
 // ---------- Input ----------
 function canLaunch() {
-  return state === 'play' && performance.now() - lastLaunch > LAUNCH_COOLDOWN;
+  return state === 'play' && simTime - lastLaunch > LAUNCH_COOLDOWN;
 }
 
 function aimVector() {
@@ -499,7 +522,7 @@ function launch() {
   const p = createPuck(launcherX, launcherY, currentValue, v.dx * v.power, v.dy * v.power);
   burst(launcherX, launcherY + 6, p.color, 8, 2);
   sfx.launch(v.power);
-  lastLaunch = performance.now();
+  lastLaunch = simTime;
   currentValue = nextValue;
   nextValue = randLaunchValue();
 }
@@ -522,11 +545,13 @@ canvas.addEventListener('pointerdown', e => {
     if (inRect(e.clientX, e.clientY, menuButtons && menuButtons.timed)) { mode = 'timed'; startGame(); }
     else if (inRect(e.clientX, e.clientY, menuButtons && menuButtons.zen)) { mode = 'zen'; startGame(); }
     else if (inRect(e.clientX, e.clientY, menuSoundRect)) { setSound(!soundOn); if (soundOn) sfx.tick(); }
+    else if (inRect(e.clientX, e.clientY, menuGfxRect)) { setLowGfx(!lowGfx); if (soundOn) sfx.tick(); }
     return;
   }
   if (state === 'paused') {
     const b = pausedButtons;
     if (inRect(e.clientX, e.clientY, b && b.sound)) { setSound(!soundOn); if (soundOn) sfx.tick(); }
+    else if (inRect(e.clientX, e.clientY, b && b.gfx)) { setLowGfx(!lowGfx); if (soundOn) sfx.tick(); }
     else if (inRect(e.clientX, e.clientY, b && b.exit)) state = 'menu';
     else state = 'play'; // resume button — or any tap outside the buttons
     return;
@@ -566,6 +591,7 @@ document.addEventListener('gesturestart', e => e.preventDefault());
 let lastT = performance.now(), acc = 0;
 let simTime = 0; // simulated clock, advances with physics steps
 const STEP = 1000 / 60;
+const MAX_STEPS = 6; // catch-up budget per frame before conceding slow-motion
 
 // per-physics-step puck maintenance (escape cleanup, line crossing, bad launches)
 function stepPucks() {
@@ -596,32 +622,44 @@ function stepPhysics() {
   simTime += STEP;
   processMerges();
   stepPucks();
+  if (pendingTargetCheck && simTime >= pendingTargetCheck) {
+    pendingTargetCheck = 0;
+    if (state === 'play' && objective) {
+      const hit = pucks.find(p => p.value === objective.value);
+      if (hit) completeObjective(hit);
+    }
+  }
 }
 
 function frame(now) {
   requestAnimationFrame(frame);
-  let dtMs = Math.min(now - lastT, 50); // clamp: pauses in background
+  let dtMs = Math.min(now - lastT, 100); // clamp: pauses in background
   lastT = now;
   const dt = dtMs / 1000;
 
   if (state === 'play') {
     acc += dtMs;
     let steps = 0;
-    while (acc >= STEP && steps < 4) {
+    while (acc >= STEP && steps < MAX_STEPS) {
       stepPhysics();
       acc -= STEP; steps++;
     }
-    if (steps === 4) acc = 0;
+    if (steps === MAX_STEPS) acc = 0;
 
     // trails (visual only)
-    for (const p of pucks) {
-      p.trail.push({ x: p.body.position.x, y: p.body.position.y });
-      if (p.trail.length > 8) p.trail.shift();
+    if (!lowGfx) {
+      for (const p of pucks) {
+        p.trail.push({ x: p.body.position.x, y: p.body.position.y });
+        if (p.trail.length > 8) p.trail.shift();
+      }
     }
 
     if (mode === 'timed') {
       const prevTime = timeLeft;
-      timeLeft -= dt;
+      // drain by simulated time, not wall clock — if physics falls behind on a
+      // slow device the whole game slows in lockstep instead of the timer
+      // drifting apart from puck movement and the launch cooldown
+      timeLeft -= steps * STEP / 1000;
       if (warned30 && timeLeft > 31) warned30 = false; // a bonus lifted us out of the danger zone
       if (!warned30 && prevTime > 30 && timeLeft <= 30) {
         warned30 = true;
@@ -656,6 +694,11 @@ function roundRect(x, y, w, h, r) {
 }
 
 function drawBackground(now) {
+  if (lowGfx) {
+    ctx.fillStyle = '#070917';
+    ctx.fillRect(0, 0, W, H);
+    return;
+  }
   const g = ctx.createLinearGradient(0, 0, 0, H);
   g.addColorStop(0, '#0a0d21');
   g.addColorStop(0.55, '#070917');
@@ -674,8 +717,7 @@ function drawBackground(now) {
 function drawBoardFrame() {
   ctx.save();
   ctx.strokeStyle = 'rgba(99,102,241,0.55)';
-  ctx.shadowColor = '#6366f1';
-  ctx.shadowBlur = 14;
+  glow('#6366f1', 14);
   ctx.lineWidth = 2;
   roundRect(playLeft, playTop, playRight - playLeft, playBottom - playTop, 14);
   ctx.stroke();
@@ -684,8 +726,7 @@ function drawBoardFrame() {
   ctx.save();
   ctx.setLineDash([7, 9]);
   ctx.strokeStyle = 'rgba(34,211,238,0.45)';
-  ctx.shadowColor = '#22d3ee';
-  ctx.shadowBlur = 6;
+  glow('#22d3ee', 6);
   ctx.lineWidth = 1.5;
   ctx.beginPath();
   ctx.moveTo(playLeft + 14, launchLineY);
@@ -716,13 +757,16 @@ function drawTargetWatermark() {
 function drawPuckAt(x, y, r, value, color, alpha) {
   ctx.save();
   ctx.globalAlpha = alpha == null ? 1 : alpha;
-  ctx.shadowColor = color;
-  ctx.shadowBlur = 18;
-  const g = ctx.createRadialGradient(x - r * 0.3, y - r * 0.35, r * 0.15, x, y, r);
-  g.addColorStop(0, color);
-  g.addColorStop(0.75, color);
-  g.addColorStop(1, 'rgba(5,6,15,0.9)');
-  ctx.fillStyle = g;
+  if (lowGfx) {
+    ctx.fillStyle = color;
+  } else {
+    glow(color, 18);
+    const g = ctx.createRadialGradient(x - r * 0.3, y - r * 0.35, r * 0.15, x, y, r);
+    g.addColorStop(0, color);
+    g.addColorStop(0.75, color);
+    g.addColorStop(1, 'rgba(5,6,15,0.9)');
+    ctx.fillStyle = g;
+  }
   ctx.beginPath();
   ctx.arc(x, y, r, 0, Math.PI * 2);
   ctx.fill();
@@ -742,22 +786,24 @@ function drawPuckAt(x, y, r, value, color, alpha) {
 
 function drawPucks() {
   // trails
-  ctx.save();
-  ctx.globalCompositeOperation = 'lighter';
-  for (const p of pucks) {
-    const b = p.body;
-    const sp = Math.hypot(b.velocity.x, b.velocity.y);
-    if (sp < 1.4 || p.trail.length < 2) continue;
-    for (let i = 0; i < p.trail.length - 1; i++) {
-      const t = i / p.trail.length;
-      ctx.globalAlpha = t * 0.16 * clamp(sp / 8, 0, 1);
-      ctx.fillStyle = p.color;
-      ctx.beginPath();
-      ctx.arc(p.trail[i].x, p.trail[i].y, p.r * (0.4 + 0.5 * t), 0, Math.PI * 2);
-      ctx.fill();
+  if (!lowGfx) {
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+    for (const p of pucks) {
+      const b = p.body;
+      const sp = Math.hypot(b.velocity.x, b.velocity.y);
+      if (sp < 1.4 || p.trail.length < 2) continue;
+      for (let i = 0; i < p.trail.length - 1; i++) {
+        const t = i / p.trail.length;
+        ctx.globalAlpha = t * 0.16 * clamp(sp / 8, 0, 1);
+        ctx.fillStyle = p.color;
+        ctx.beginPath();
+        ctx.arc(p.trail[i].x, p.trail[i].y, p.r * (0.4 + 0.5 * t), 0, Math.PI * 2);
+        ctx.fill();
+      }
     }
+    ctx.restore();
   }
-  ctx.restore();
   for (const p of pucks) drawPuckAt(p.body.position.x, p.body.position.y, p.r, p.value, p.color);
   // pucks one merge away from the target pulse in its color
   if (state === 'play' && objective) {
@@ -766,11 +812,10 @@ function drawPucks() {
     const pulse = 0.5 + 0.5 * Math.sin(performance.now() / 260);
     ctx.save();
     ctx.strokeStyle = tc;
-    ctx.shadowColor = tc;
     for (const p of pucks) {
       if (p.value !== half) continue;
       ctx.globalAlpha = 0.35 + 0.4 * pulse;
-      ctx.shadowBlur = 10;
+      glow(tc, 10);
       ctx.lineWidth = 2;
       ctx.beginPath();
       ctx.arc(p.body.position.x, p.body.position.y, p.r + 5, 0, Math.PI * 2);
@@ -847,8 +892,7 @@ function drawAimGuide() {
   }
   ctx.save();
   const color = puckColor(currentValue);
-  ctx.shadowColor = color;
-  ctx.shadowBlur = 8;
+  glow(color, 8);
   // cue-stick tail behind the launcher, length ∝ power
   const frac = (v.power - MIN_POWER) / (MAX_POWER - MIN_POWER);
   const r0 = puckRadius(currentValue) + 6;
@@ -906,7 +950,7 @@ function drawHUD(now) {
   ctx.font = '600 11px system-ui, sans-serif';
   ctx.fillText(mode === 'zen' ? 'TARGETS' : 'SCORE', 16, topY + 10);
   ctx.fillStyle = '#e8ecff';
-  ctx.shadowColor = '#22d3ee'; ctx.shadowBlur = 10;
+  glow('#22d3ee', 10);
   ctx.font = '800 28px system-ui, sans-serif';
   ctx.fillText(mode === 'zen' ? objectivesCompleted : Math.round(scoreShown).toLocaleString(), 16, topY + 38);
   ctx.shadowBlur = 0;
@@ -938,7 +982,7 @@ function drawHUD(now) {
     ctx.fillStyle = 'rgba(150,160,200,0.7)';
     ctx.fillText('TIME', W - 16, topY + 10);
     ctx.fillStyle = tColor;
-    ctx.shadowColor = tColor; ctx.shadowBlur = urgent ? 16 : 8;
+    glow(tColor, urgent ? 16 : 8);
     const tPulse = urgent && state === 'play' ? 1 + 0.06 * Math.sin(now / 90) : 1;
     ctx.font = `800 ${28 * tPulse}px system-ui, sans-serif`;
     ctx.fillText(fmtTime(timeLeft), W - 16, topY + 38);
@@ -950,7 +994,7 @@ function drawHUD(now) {
     const frac = clamp(timeLeft / START_TIME, 0, 1);
     if (frac > 0) {
       ctx.fillStyle = tColor;
-      ctx.shadowColor = tColor; ctx.shadowBlur = 6;
+      glow(tColor, 6);
       roundRect(16, barY, barW * frac, 5, 2.5); ctx.fill();
       ctx.shadowBlur = 0;
     }
@@ -962,7 +1006,7 @@ function drawHUD(now) {
     const accent = puckColor(o.value);
     ctx.save();
     ctx.textBaseline = 'middle';
-    if (o.flash > 0) { ctx.shadowColor = accent; ctx.shadowBlur = 26 * o.flash; }
+    if (o.flash > 0) glow(accent, 26 * o.flash);
     ctx.fillStyle = 'rgba(16,20,44,0.85)';
     roundRect(x, y, pw, chipH, 14); ctx.fill();
     ctx.strokeStyle = accent;
@@ -977,7 +1021,7 @@ function drawHUD(now) {
     ctx.font = '700 10px system-ui, sans-serif';
     ctx.fillText('TARGET', x + 16, y + 13);
     ctx.fillStyle = accent;
-    ctx.shadowColor = accent; ctx.shadowBlur = 12;
+    glow(accent, 12);
     ctx.font = `800 ${o.value >= 100 ? 25 : 30}px system-ui, sans-serif`;
     ctx.fillText(o.value, x + 16, y + chipH / 2 + 9);
     ctx.shadowBlur = 0;
@@ -1027,8 +1071,7 @@ function drawEffects() {
   for (const f of floaters) {
     ctx.globalAlpha = clamp(f.life, 0, 1);
     ctx.fillStyle = f.color;
-    ctx.shadowColor = f.color;
-    ctx.shadowBlur = 8;
+    glow(f.color, 8);
     ctx.font = `800 ${f.size}px system-ui, sans-serif`;
     ctx.fillText(f.text, f.x, f.y);
   }
@@ -1049,8 +1092,7 @@ function drawMenu(now) {
     { v: 32, x: W * 0.5 + Math.sin(now / 2000 + 4) * 20, y: cy - 130 + Math.cos(now / 1600 + 3) * 8 },
   ];
   for (const d of demo) drawPuckAt(d.x, d.y, puckRadius(d.v), d.v, puckColor(d.v), 0.85);
-  ctx.shadowColor = '#22d3ee';
-  ctx.shadowBlur = 24;
+  glow('#22d3ee', 24);
   ctx.fillStyle = '#e8ecff';
   ctx.font = `800 ${Math.min(52, W * 0.13)}px system-ui, sans-serif`;
   ctx.fillText('SUM SHUFFLE', W / 2, cy);
@@ -1083,7 +1125,7 @@ function drawMenu(now) {
     roundRect(b.r.x, b.r.y, b.r.w, b.r.h, 14); ctx.fill();
     ctx.strokeStyle = b.color;
     ctx.globalAlpha = pulse;
-    ctx.shadowColor = b.color; ctx.shadowBlur = 12;
+    glow(b.color, 12);
     ctx.lineWidth = 1.8;
     roundRect(b.r.x, b.r.y, b.r.w, b.r.h, 14); ctx.stroke();
     ctx.shadowBlur = 0;
@@ -1111,6 +1153,17 @@ function drawMenu(now) {
   ctx.fillStyle = soundOn ? '#8b95c9' : 'rgba(139,149,201,0.55)';
   ctx.font = '700 13px system-ui, sans-serif';
   ctx.fillText(soundOn ? '🔊 SOUND ON' : '🔇 SOUND OFF', W / 2, sy + sh / 2);
+  // graphics quality toggle
+  const gy = sy + sh + 12;
+  menuGfxRect = { x: W / 2 - sw / 2, y: gy, w: sw, h: sh };
+  ctx.fillStyle = 'rgba(16,20,44,0.9)';
+  roundRect(menuGfxRect.x, gy, sw, sh, 10); ctx.fill();
+  ctx.strokeStyle = 'rgba(139,149,201,0.55)';
+  ctx.lineWidth = 1.4;
+  roundRect(menuGfxRect.x, gy, sw, sh, 10); ctx.stroke();
+  ctx.fillStyle = '#8b95c9';
+  ctx.font = '700 13px system-ui, sans-serif';
+  ctx.fillText(lowGfx ? '⚡ GRAPHICS: LOW' : '✨ GRAPHICS: FULL', W / 2, gy + sh / 2);
   ctx.restore();
 }
 
@@ -1124,18 +1177,18 @@ function drawGameOver(now) {
   ctx.textBaseline = 'middle';
   const cy = H * 0.32;
   ctx.fillStyle = '#f87171';
-  ctx.shadowColor = '#f87171'; ctx.shadowBlur = 20;
+  glow('#f87171', 20);
   ctx.font = '800 40px system-ui, sans-serif';
   ctx.fillText("TIME'S UP", W / 2, cy);
   ctx.shadowBlur = 0;
   ctx.fillStyle = '#e8ecff';
-  ctx.shadowColor = '#22d3ee'; ctx.shadowBlur = 16;
+  glow('#22d3ee', 16);
   ctx.font = '800 54px system-ui, sans-serif';
   ctx.fillText(score.toLocaleString(), W / 2, cy + 74);
   ctx.shadowBlur = 0;
   if (score >= best && score > 0) {
     ctx.fillStyle = '#facc15';
-    ctx.shadowColor = '#facc15'; ctx.shadowBlur = 10;
+    glow('#facc15', 10);
     ctx.font = '800 18px system-ui, sans-serif';
     ctx.fillText('★ NEW BEST ★', W / 2, cy + 116);
     ctx.shadowBlur = 0;
@@ -1150,7 +1203,7 @@ function drawGameOver(now) {
   if (now - overAt > 700) {
     ctx.globalAlpha = t * (0.6 + 0.4 * Math.sin(now / 350));
     ctx.fillStyle = '#22d3ee';
-    ctx.shadowColor = '#22d3ee'; ctx.shadowBlur = 14;
+    glow('#22d3ee', 14);
     ctx.font = '800 20px system-ui, sans-serif';
     ctx.fillText('TAP TO CONTINUE', W / 2, cy + 220);
   }
@@ -1185,11 +1238,16 @@ function render(now) {
       const breathe = 0.5 + 0.5 * Math.sin(now / 260);
       a = 0.05 + 0.2 * u * breathe;
     }
-    const vg = ctx.createRadialGradient(W / 2, H / 2, H * 0.22, W / 2, H / 2, H * 0.75);
-    vg.addColorStop(0, 'rgba(248,60,60,0)');
-    vg.addColorStop(1, `rgba(248,60,60,${a})`);
-    ctx.fillStyle = vg;
-    ctx.fillRect(0, 0, W, H);
+    if (lowGfx) {
+      ctx.fillStyle = `rgba(248,60,60,${a * 0.4})`;
+      ctx.fillRect(0, 0, W, H);
+    } else {
+      const vg = ctx.createRadialGradient(W / 2, H / 2, H * 0.22, W / 2, H / 2, H * 0.75);
+      vg.addColorStop(0, 'rgba(248,60,60,0)');
+      vg.addColorStop(1, `rgba(248,60,60,${a})`);
+      ctx.fillStyle = vg;
+      ctx.fillRect(0, 0, W, H);
+    }
     if (timeLeft <= 10) {
       // faint full-screen wash on top for the final stretch
       ctx.fillStyle = `rgba(248,40,40,${a * 0.3})`;
@@ -1210,7 +1268,7 @@ function drawPaused(now) {
   ctx.textBaseline = 'middle';
   const cy = H * 0.3;
   ctx.fillStyle = '#22d3ee';
-  ctx.shadowColor = '#22d3ee'; ctx.shadowBlur = 18;
+  glow('#22d3ee', 18);
   ctx.font = '800 38px system-ui, sans-serif';
   ctx.fillText('PAUSED', W / 2, cy);
   ctx.shadowBlur = 0;
@@ -1218,11 +1276,13 @@ function drawPaused(now) {
   pausedButtons = {
     resume: { x: bx, y: cy + 60, w: bw, h: bh },
     sound:  { x: bx, y: cy + 128, w: bw, h: bh },
-    exit:   { x: bx, y: cy + 196, w: bw, h: bh }
+    gfx:    { x: bx, y: cy + 196, w: bw, h: bh },
+    exit:   { x: bx, y: cy + 264, w: bw, h: bh }
   };
   const btns = [
     { r: pausedButtons.resume, label: 'RESUME', color: '#22d3ee', glow: true },
     { r: pausedButtons.sound, label: soundOn ? '🔊 SOUND ON' : '🔇 SOUND OFF', color: '#a78bfa' },
+    { r: pausedButtons.gfx, label: lowGfx ? '⚡ GRAPHICS: LOW' : '✨ GRAPHICS: FULL', color: '#a78bfa' },
     { r: pausedButtons.exit, label: 'EXIT TO MENU', color: '#8b95c9' }
   ];
   for (const b of btns) {
@@ -1230,7 +1290,7 @@ function drawPaused(now) {
     roundRect(b.r.x, b.r.y, b.r.w, b.r.h, 14); ctx.fill();
     ctx.strokeStyle = b.color;
     ctx.globalAlpha = b.glow ? 0.75 + 0.25 * Math.sin(now / 350) : 0.55;
-    if (b.glow) { ctx.shadowColor = b.color; ctx.shadowBlur = 12; }
+    if (b.glow) glow(b.color, 12);
     ctx.lineWidth = 1.8;
     roundRect(b.r.x, b.r.y, b.r.w, b.r.h, 14); ctx.stroke();
     ctx.shadowBlur = 0;
@@ -1260,7 +1320,9 @@ window.__dbg = {
   roll: randLaunchValue,
   step(ticks) { for (let i = 0; i < (ticks || 1); i++) stepPhysics(); },
   get state() { return { state, mode, score, timeLeft, pucks: pucks.map(p => ({ v: p.value, x: p.body.position.x | 0, y: p.body.position.y | 0 })), objective: objective && { v: objective.value, pts: objective.points, time: objective.time }, next: nextObjective && { v: nextObjective.value }, objectivesCompleted }; },
-  set time(t) { timeLeft = t; }
+  set time(t) { timeLeft = t; },
+  get lowGfx() { return lowGfx; },
+  set lowGfx(on) { setLowGfx(!!on); }
 };
 
 resize();
