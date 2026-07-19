@@ -66,8 +66,12 @@ const OBJ_POINTS = { 4: 40, 8: 100, 16: 240, 32: 600, 64: 1400, 128: 3200, 256: 
 const RUSH_CHANCE = 0.35;      // chance a target rolls a rush bonus (never the first target)
 const RUSH_WINDOW = { 4: 10, 8: 14, 16: 18, 32: 24, 64: 30, 128: 36, 256: 42, 512: 50 }; // seconds to earn it
 const POWERUPS = {
-  rapid: { label: 'RAPID FIRE', icon: '⚡', color: '#fb923c', duration: 6, cooldown: 120 },
-  multi: { label: 'MULTI SHOT', icon: '✦', color: '#4ade80', duration: 7, spread: 0.22 }
+  rapid:  { label: 'RAPID FIRE', icon: '⚡', color: '#fb923c', duration: 6, cooldown: 120 },
+  multi:  { label: 'MULTI SHOT', icon: '✦', color: '#4ade80', duration: 7, spread: 0.22 },
+  magnet: { label: 'MAGNET', icon: '🧲', color: '#e879f9', duration: 8, radius: 180, strength: 5 },
+  blast:  { label: 'BLAST', icon: '💥', color: '#f87171', duration: 8, radius: 160, strength: 6.5 },
+  freeze: { label: 'TIME FREEZE', icon: '❄', color: '#7dd3fc', duration: 6 },
+  bouncy: { label: 'SUPER BOUNCE', icon: '🏀', color: '#facc15', duration: 7, rest: 1.06 }
 };
 const PALETTE = ['#22d3ee','#a78bfa','#f472b6','#fb923c','#facc15','#4ade80','#f87171','#60a5fa','#2dd4bf','#e879f9','#fef08a','#f0abfc'];
 
@@ -294,7 +298,7 @@ function createPuck(x, y, value, vx, vy) {
   const bornAt = simTime;
   const body = Bodies.circle(x, y, r, {
     frictionAir: FRICTION_AIR,
-    restitution: REST_PUCK,
+    restitution: powerup && powerup.type === 'bouncy' ? POWERUPS.bouncy.rest : REST_PUCK,
     friction: 0.01,
     density: 0.0015,
     label: 'puck',
@@ -349,7 +353,9 @@ function makeObjective(excludeValue) {
   // some targets roll a rush bonus: build them inside the window for a power-up
   let rush = null;
   if (objectivesCompleted >= 1 && Math.random() < RUSH_CHANCE) {
-    const type = Math.random() < 0.5 ? 'rapid' : 'multi';
+    // freeze is meaningless without a timer, so zen never rolls it
+    const types = Object.keys(POWERUPS).filter(t => t !== 'freeze' || mode === 'timed');
+    const type = types[Math.floor(Math.random() * types.length)];
     rush = { type, window: RUSH_WINDOW[value] || 30, deadline: 0, missed: false };
   }
   return { value, points: OBJ_POINTS[value] || value * 25, time: OBJ_TIME[value] || 25, flash: 0, rush };
@@ -361,9 +367,27 @@ function activateObjective(o) {
   if (o.rush) o.rush.deadline = simTime + o.rush.window * 1000;
 }
 
+// one-time radial kick from (cx,cy): sign -1 pulls pucks in, +1 shoves them out
+function radialImpulse(cx, cy, radius, strength, sign) {
+  for (const p of pucks) {
+    if (!p.crossed) continue; // the launch zone is out of reach
+    const dx = p.body.position.x - cx, dy = p.body.position.y - cy;
+    const d = Math.hypot(dx, dy);
+    if (d < 1 || d > radius) continue;
+    const s = strength * (1 - d / radius) * sign;
+    Body.setVelocity(p.body, { x: p.body.velocity.x + (dx / d) * s, y: p.body.velocity.y + (dy / d) * s });
+  }
+}
+
+function setPucksRestitution(rest) {
+  for (const p of pucks) p.body.restitution = rest;
+}
+
 function activatePowerup(type, x, y) {
+  if (powerup && powerup.type === 'bouncy' && type !== 'bouncy') setPucksRestitution(REST_PUCK);
   const def = POWERUPS[type];
   powerup = { type, until: simTime + def.duration * 1000 };
+  if (type === 'bouncy') setPucksRestitution(def.rest);
   floaters.push({ x: W / 2, y: lerp(playTop, playBottom, 0.5), text: `${def.icon} ${def.label}!`, color: def.color, size: 26, life: 1.3, vy: -0.5 });
   burst(x, y, def.color, 30, 4);
   shake.t = Math.max(shake.t, 0.2); shake.mag = Math.max(shake.mag, 4);
@@ -452,6 +476,16 @@ function processMerges() {
     }
     shake.t = Math.max(shake.t, 0.08); shake.mag = Math.max(shake.mag, 2);
     sfx.merge(nv);
+    if (powerup && powerup.type === 'magnet') {
+      radialImpulse(x, y, POWERUPS.magnet.radius, POWERUPS.magnet.strength, -1);
+      // collapsing ring sells the pull
+      shockwaves.push({ x, y, r: POWERUPS.magnet.radius * 0.7, maxR: 10, life: 1, color: POWERUPS.magnet.color });
+    } else if (powerup && powerup.type === 'blast') {
+      radialImpulse(x, y, POWERUPS.blast.radius, POWERUPS.blast.strength, 1);
+      shockwaves.push({ x, y, r: np.r, maxR: POWERUPS.blast.radius, life: 1, color: POWERUPS.blast.color });
+      burst(x, y, POWERUPS.blast.color, 14, 4.5);
+      shake.t = Math.max(shake.t, 0.15); shake.mag = Math.max(shake.mag, 3.5);
+    }
     if (objective && np.value === objective.value) completeObjective(np);
   }
   mergedIds.clear();
@@ -682,6 +716,7 @@ function stepPhysics() {
   }
   if (powerup && simTime >= powerup.until) {
     const def = POWERUPS[powerup.type];
+    if (powerup.type === 'bouncy') setPucksRestitution(REST_PUCK);
     powerup = null;
     floaters.push({ x: launcherX, y: launcherY - 60, text: def.icon + ' OVER', color: 'rgba(150,160,200,0.9)', size: 14, life: 0.9, vy: -0.5 });
     sfx.powerdown();
@@ -725,7 +760,7 @@ function frame(now) {
       // drain by simulated time, not wall clock — if physics falls behind on a
       // slow device the whole game slows in lockstep instead of the timer
       // drifting apart from puck movement and the launch cooldown
-      timeLeft -= steps * STEP / 1000;
+      if (!(powerup && powerup.type === 'freeze')) timeLeft -= steps * STEP / 1000;
       if (warned30 && timeLeft > 31) warned30 = false; // a bonus lifted us out of the danger zone
       if (!warned30 && prevTime > 30 && timeLeft <= 30) {
         warned30 = true;
@@ -782,8 +817,15 @@ function drawBackground(now) {
 
 function drawBoardFrame() {
   ctx.save();
-  ctx.strokeStyle = 'rgba(99,102,241,0.55)';
-  glow('#6366f1', 14);
+  // super bounce: the walls themselves are the power-up, so they light up
+  if (state === 'play' && powerup && powerup.type === 'bouncy') {
+    ctx.strokeStyle = POWERUPS.bouncy.color;
+    ctx.globalAlpha = 0.5 + 0.3 * Math.sin(performance.now() / 130);
+    glow(POWERUPS.bouncy.color, 16);
+  } else {
+    ctx.strokeStyle = 'rgba(99,102,241,0.55)';
+    glow('#6366f1', 14);
+  }
   ctx.lineWidth = 2;
   roundRect(playLeft, playTop, playRight - playLeft, playBottom - playTop, 14);
   ctx.stroke();
@@ -1096,12 +1138,13 @@ function drawHUD(now) {
   ctx.restore();
   if (mode === 'timed') {
     // time
-    const urgent = timeLeft <= 10;
+    const frozen = state === 'play' && powerup && powerup.type === 'freeze';
+    const urgent = !frozen && timeLeft <= 10;
     const warn = timeLeft <= 30;
-    const tColor = urgent ? '#f87171' : warn ? '#facc15' : '#22d3ee';
+    const tColor = frozen ? '#7dd3fc' : urgent ? '#f87171' : warn ? '#facc15' : '#22d3ee';
     ctx.textAlign = 'right';
     ctx.fillStyle = 'rgba(150,160,200,0.7)';
-    ctx.fillText('TIME', W - 16, topY + 10);
+    ctx.fillText(frozen ? '❄ FROZEN' : 'TIME', W - 16, topY + 10);
     ctx.fillStyle = tColor;
     glow(tColor, urgent ? 16 : 8);
     const tPulse = urgent && state === 'play' ? 1 + 0.06 * Math.sin(now / 90) : 1;
@@ -1381,7 +1424,7 @@ function render(now) {
   if (state !== 'menu') drawHUD(now);
   // time-running-out glow: creeps in from 30s, breathes harder as time drains,
   // and snaps to a once-per-second pulse (synced with the ticks) in the last 5s
-  if (state === 'play' && mode === 'timed' && timeLeft <= 30 && timeLeft > 0) {
+  if (state === 'play' && mode === 'timed' && timeLeft <= 30 && timeLeft > 0 && !(powerup && powerup.type === 'freeze')) {
     const u = clamp((30 - timeLeft) / 25, 0, 1); // 0 at 30s → 1 at 5s
     let a;
     if (timeLeft <= 5) {
