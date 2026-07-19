@@ -86,7 +86,9 @@ const PALETTE = ['#22d3ee','#a78bfa','#f472b6','#fb923c','#facc15','#4ade80','#f
 
 const log2 = v => Math.round(Math.log2(v));
 const puckColor = v => PALETTE[Math.min(log2(v), PALETTE.length - 1)];
-const puckRadius = v => 16 + 3.2 * log2(v);
+// each doubling adds less radius than the last (asymptote 42), so late-game
+// boards full of big pucks stay navigable instead of wall-to-wall circles
+const puckRadius = v => 16 + 26 * (1 - Math.pow(0.86, log2(v)));
 const clamp = (x, a, b) => Math.min(b, Math.max(a, x));
 const lerp = (a, b, t) => a + (b - a) * t;
 const rnd = (a, b) => a + Math.random() * (b - a);
