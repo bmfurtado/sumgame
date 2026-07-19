@@ -63,7 +63,11 @@ const AIM_MAX_TILT = 1.22;    // radians either side of straight up
 const OBJ_POINTS = { 4: 40, 8: 100, 16: 240, 32: 600, 64: 1400, 128: 3200, 256: 7000, 512: 15000 };
 
 // ---------- Power-ups ----------
-const RUSH_CHANCE = 0.35;      // chance a target rolls a rush bonus (never the first target)
+const RUSH_CHANCE = 0.35;      // base chance a target rolls a rush bonus (never the first target)
+const RUSH_CHANCE_RAMP = 0.025; // added per completed target, so offers keep pace as targets slow down
+const RUSH_CHANCE_MAX = 0.6;
+const RUSH_PITY = 2;           // a rush is guaranteed after this many rush-less targets in a row
+const DEAL_FLOOR_DIV = 16;     // never deal below target/16 — skips regrinding the ladder's bottom
 const RUSH_WINDOW = { 4: 10, 8: 14, 16: 18, 32: 24, 64: 30, 128: 36, 256: 42, 512: 50 }; // seconds to earn it
 const RARE_WINDOW_SCALE = 0.7; // rare power-ups must be earned faster
 const RUSH_WEIGHT = { common: 3, rare: 1 };
@@ -269,6 +273,7 @@ let timeLeft = START_TIME;
 let lastTickSecond = -1;
 let warned30 = false;          // 30s warning fired (re-arms if bonuses push time back up)
 let objective = null, nextObjective = null;   // {value, points, time, flash, rush}
+let rushDrought = 0;           // targets rolled in a row without a rush offer (pity counter)
 let powers = [];               // active power-ups, stackable: [{type, until (simTime ms)}], newest last
 const hasPower = t => powers.some(p => p.type === t);
 let pendingTargetCheck = 0;    // simTime deadline for the delayed fresh-target re-check
@@ -324,15 +329,17 @@ function removePuck(p) {
 
 function randLaunchValue() {
   // launchable values go up to the biggest puck on the board, each doubling
-  // half as likely as the one below it (small values always dominate)
+  // half as likely as the one below it (small values always dominate), but
+  // never below target/16 — late-game targets shouldn't be rebuilt from 1s
   const biggest = pucks.reduce((m, p) => Math.max(m, p.value), 0);
-  const maxExp = clamp(log2(Math.max(2, biggest)), 1, 8);
+  const minExp = objective ? Math.max(0, log2(objective.value) - log2(DEAL_FLOOR_DIV)) : 0;
+  const maxExp = Math.max(minExp, clamp(log2(Math.max(2, biggest)), 1, 8));
   let total = 0;
   const weights = [];
-  for (let k = 0; k <= maxExp; k++) { const w = Math.pow(LAUNCH_DECAY, k); weights.push(w); total += w; }
+  for (let k = minExp; k <= maxExp; k++) { const w = Math.pow(LAUNCH_DECAY, k - minExp); weights.push(w); total += w; }
   let roll = Math.random() * total;
-  for (let k = 0; k <= maxExp; k++) { roll -= weights[k]; if (roll <= 0) return Math.pow(2, k); }
-  return 1;
+  for (let k = minExp; k <= maxExp; k++) { roll -= weights[k - minExp]; if (roll <= 0) return Math.pow(2, k); }
+  return Math.pow(2, minExp);
 }
 
 // ---------- Objectives ----------
@@ -355,10 +362,19 @@ function makeObjective(excludeValue) {
   const value = pool[Math.floor(Math.random() * pool.length)];
   // some targets roll a rush bonus: build them inside the window for a power-up
   let rush = null;
-  if (objectivesCompleted >= 1 && Math.random() < RUSH_CHANCE) {
-    const type = rollRushType();
-    const scale = POWERUPS[type].rare ? RARE_WINDOW_SCALE : 1;
-    rush = { type, window: Math.round((RUSH_WINDOW[value] || 30) * scale), deadline: 0, missed: false };
+  if (objectivesCompleted >= 1) {
+    // offer rate ramps with progress (targets take longer to build late game,
+    // so per-target chance rises to keep power-ups flowing per minute), and a
+    // pity counter guarantees an offer after RUSH_PITY dry targets
+    const chance = Math.min(RUSH_CHANCE_MAX, RUSH_CHANCE + RUSH_CHANCE_RAMP * objectivesCompleted);
+    if (rushDrought >= RUSH_PITY || Math.random() < chance) {
+      const type = rollRushType();
+      const scale = POWERUPS[type].rare ? RARE_WINDOW_SCALE : 1;
+      rush = { type, window: Math.round((RUSH_WINDOW[value] || 30) * scale), deadline: 0, missed: false };
+      rushDrought = 0;
+    } else {
+      rushDrought++;
+    }
   }
   return { value, points: OBJ_POINTS[value] || value * 25, time: OBJ_TIME[value] || 25, flash: 0, rush };
 }
@@ -557,6 +573,7 @@ function startGame() {
   objectivesCompleted = 0; biggestPuck = 0;
   pendingTargetCheck = 0;
   powers = [];
+  rushDrought = 0;
   objective = makeObjective();
   activateObjective(objective);
   nextObjective = makeObjective(objective.value);
