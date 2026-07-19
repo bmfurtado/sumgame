@@ -61,6 +61,14 @@ const LAUNCH_COOLDOWN = 380;  // ms between shots
 const AIM_MAX_TILT = 1.22;    // radians either side of straight up
 
 const OBJ_POINTS = { 4: 40, 8: 100, 16: 240, 32: 600, 64: 1400, 128: 3200, 256: 7000, 512: 15000 };
+
+// ---------- Power-ups ----------
+const RUSH_CHANCE = 0.35;      // chance a target rolls a rush bonus (never the first target)
+const RUSH_WINDOW = { 4: 10, 8: 14, 16: 18, 32: 24, 64: 30, 128: 36, 256: 42, 512: 50 }; // seconds to earn it
+const POWERUPS = {
+  rapid: { label: 'RAPID FIRE', icon: '⚡', color: '#fb923c', duration: 6, cooldown: 120 },
+  multi: { label: 'MULTI SHOT', icon: '✦', color: '#4ade80', duration: 7, spread: 0.22 }
+};
 const PALETTE = ['#22d3ee','#a78bfa','#f472b6','#fb923c','#facc15','#4ade80','#f87171','#60a5fa','#2dd4bf','#e879f9','#fef08a','#f0abfc'];
 
 const log2 = v => Math.round(Math.log2(v));
@@ -208,6 +216,9 @@ const sfx = {
     noiseHit(0.06, 0.1, 3800, 3);
   },
   objective() { [523, 659, 784, 1047].forEach((f, i) => { tone(f, 'sine', 0.22, 0.24, null, i * 0.06); tone(f, 'triangle', 0.18, 0.1, null, i * 0.06); }); },
+  powerup() { [392, 523, 659, 784, 1047].forEach((f, i) => tone(f, 'square', 0.14, 0.13, null, i * 0.05)); tone(1568, 'sine', 0.35, 0.16, 2093, 0.28); },
+  powerdown() { tone(700, 'sawtooth', 0.18, 0.1, 350); tone(450, 'sawtooth', 0.22, 0.09, 220, 0.1); },
+  rushMiss() { tone(330, 'sine', 0.16, 0.14, 294); tone(262, 'sine', 0.2, 0.12, 233, 0.12); },
   timeBonus() { tone(880, 'sine', 0.35, 0.24, 1760); tone(2093, 'sine', 0.15, 0.14, null, 0.12); tone(2637, 'sine', 0.18, 0.12, null, 0.2); },
   tick() { tone(1050, 'square', 0.035, 0.1); },
   warn30() { tone(440, 'sine', 0.14, 0.22); tone(330, 'sine', 0.18, 0.2, null, 0.14); },
@@ -251,7 +262,8 @@ let score = 0, scoreShown = 0, best = 0;
 let timeLeft = START_TIME;
 let lastTickSecond = -1;
 let warned30 = false;          // 30s warning fired (re-arms if bonuses push time back up)
-let objective = null, nextObjective = null;   // {value, points, time, flash}
+let objective = null, nextObjective = null;   // {value, points, time, flash, rush}
+let powerup = null;            // active power-up: {type, until (simTime ms)}
 let pendingTargetCheck = 0;    // simTime deadline for the delayed fresh-target re-check
 let objectivesCompleted = 0;
 let pucks = [];                // {body, value, r, color, trail[]}
@@ -334,7 +346,29 @@ function makeObjective(excludeValue) {
   let pool = base.filter(v => v !== excludeValue && v <= cap);
   if (!pool.length) pool = [Math.min(...base)];
   const value = pool[Math.floor(Math.random() * pool.length)];
-  return { value, points: OBJ_POINTS[value] || value * 25, time: OBJ_TIME[value] || 25, flash: 0 };
+  // some targets roll a rush bonus: build them inside the window for a power-up
+  let rush = null;
+  if (objectivesCompleted >= 1 && Math.random() < RUSH_CHANCE) {
+    const type = Math.random() < 0.5 ? 'rapid' : 'multi';
+    rush = { type, window: RUSH_WINDOW[value] || 30, deadline: 0, missed: false };
+  }
+  return { value, points: OBJ_POINTS[value] || value * 25, time: OBJ_TIME[value] || 25, flash: 0, rush };
+}
+
+// the rush window starts when the target becomes the active one, not when it
+// was rolled — nextObjective sits on deck for an unknown amount of time
+function activateObjective(o) {
+  if (o.rush) o.rush.deadline = simTime + o.rush.window * 1000;
+}
+
+function activatePowerup(type, x, y) {
+  const def = POWERUPS[type];
+  powerup = { type, until: simTime + def.duration * 1000 };
+  floaters.push({ x: W / 2, y: lerp(playTop, playBottom, 0.5), text: `${def.icon} ${def.label}!`, color: def.color, size: 26, life: 1.3, vy: -0.5 });
+  burst(x, y, def.color, 30, 4);
+  shake.t = Math.max(shake.t, 0.2); shake.mag = Math.max(shake.mag, 4);
+  buzz(40);
+  setTimeout(() => sfx.powerup(), 180); // let the target fanfare land first
 }
 
 function completeObjective(puck) {
@@ -348,6 +382,7 @@ function completeObjective(puck) {
   floaters.push({ x, y: y - 10, text: mode === 'timed' ? `TARGET! +${o.points}` : 'TARGET!', color: '#fef08a', size: 22, life: 1, vy: -0.7 });
   shake.t = 0.25; shake.mag = 5;
   sfx.objective();
+  if (o.rush && !o.rush.missed && simTime <= o.rush.deadline) activatePowerup(o.rush.type, x, y);
   if (mode === 'timed') {
     timeLeft = Math.min(timeLeft + o.time, 599);
     floaters.push({ x, y: y + 22, text: `+${o.time}s`, color: '#facc15', size: 17, life: 1, vy: -0.5 });
@@ -356,6 +391,7 @@ function completeObjective(puck) {
   }
   objective = nextObjective;
   objective.flash = 1;
+  activateObjective(objective);
   nextObjective = makeObjective(objective.value);
   // a puck built earlier may already match the fresh target — cash it in after
   // a beat, on the sim clock so the delay scales with any slowdown
@@ -463,7 +499,9 @@ function startGame() {
   score = 0; scoreShown = 0; timeLeft = START_TIME; lastTickSecond = -1; warned30 = false;
   objectivesCompleted = 0; biggestPuck = 0;
   pendingTargetCheck = 0;
+  powerup = null;
   objective = makeObjective();
+  activateObjective(objective);
   nextObjective = makeObjective(objective.value);
   currentValue = randLaunchValue(); nextValue = randLaunchValue();
   lastLaunch = -1e9;
@@ -492,7 +530,8 @@ function endGame() {
 
 // ---------- Input ----------
 function canLaunch() {
-  return state === 'play' && simTime - lastLaunch > LAUNCH_COOLDOWN;
+  const cd = powerup && powerup.type === 'rapid' ? POWERUPS.rapid.cooldown : LAUNCH_COOLDOWN;
+  return state === 'play' && simTime - lastLaunch > cd;
 }
 
 function aimVector() {
@@ -519,8 +558,20 @@ function aimVector() {
 function launch() {
   const v = aimVector();
   if (!v || v.power <= 0) return;
-  const p = createPuck(launcherX, launcherY, currentValue, v.dx * v.power, v.dy * v.power);
-  burst(launcherX, launcherY + 6, p.color, 8, 2);
+  const multi = powerup && powerup.type === 'multi';
+  const angles = multi ? [-POWERUPS.multi.spread, 0, POWERUPS.multi.spread] : [0];
+  const r = puckRadius(currentValue);
+  for (const a of angles) {
+    const dx = v.dx * Math.cos(a) - v.dy * Math.sin(a);
+    const dy = v.dx * Math.sin(a) + v.dy * Math.cos(a);
+    // side pucks spawn shifted along the aim's perpendicular so the trio
+    // doesn't start overlapping and get shoved apart by the solver
+    const off = Math.sign(a) * (r * 2 + 6);
+    const px = clamp(launcherX - v.dy * off, playLeft + r, playRight - r);
+    const py = launcherY + v.dx * off;
+    const p = createPuck(px, py, currentValue, dx * v.power, dy * v.power);
+    burst(px, py + 6, p.color, multi ? 5 : 8, 2);
+  }
   sfx.launch(v.power);
   lastLaunch = simTime;
   currentValue = nextValue;
@@ -629,6 +680,18 @@ function stepPhysics() {
       if (hit) completeObjective(hit);
     }
   }
+  if (powerup && simTime >= powerup.until) {
+    const def = POWERUPS[powerup.type];
+    powerup = null;
+    floaters.push({ x: launcherX, y: launcherY - 60, text: def.icon + ' OVER', color: 'rgba(150,160,200,0.9)', size: 14, life: 0.9, vy: -0.5 });
+    sfx.powerdown();
+  }
+  if (objective && objective.rush && !objective.rush.missed && objective.rush.deadline && simTime > objective.rush.deadline) {
+    // the window lapsed — the target stays, only the power-up bonus is gone
+    objective.rush.missed = true;
+    floaters.push({ x: W / 2, y: chipY + chipH + 26, text: 'RUSH MISSED', color: 'rgba(150,160,200,0.9)', size: 15, life: 1, vy: -0.4 });
+    sfx.rushMiss();
+  }
 }
 
 function frame(now) {
@@ -645,6 +708,9 @@ function frame(now) {
       acc -= STEP; steps++;
     }
     if (steps === MAX_STEPS) acc = 0;
+
+    // machine-gun: while rapid fire is active, holding an aim sprays pucks
+    if (powerup && powerup.type === 'rapid' && aiming && canLaunch()) launch();
 
     // trails (visual only)
     if (!lowGfx) {
@@ -751,6 +817,15 @@ function drawTargetWatermark() {
   ctx.globalAlpha = 0.14;
   ctx.font = '700 19px system-ui, sans-serif';
   ctx.fillText(`${v / 2} + ${v / 2}`, cx, cy + size * 0.62);
+  const rush = objective.rush;
+  if (rush && !rush.missed && rush.deadline) {
+    const left = Math.max(0, (rush.deadline - simTime) / 1000);
+    const rdef = POWERUPS[rush.type];
+    ctx.fillStyle = rdef.color;
+    ctx.globalAlpha = 0.2 + 0.08 * Math.sin(performance.now() / 200);
+    ctx.font = '800 17px system-ui, sans-serif';
+    ctx.fillText(`${rdef.icon} ${rdef.label} · ${Math.ceil(left)}s`, cx, cy + size * 0.62 + 32);
+  }
   ctx.restore();
 }
 
@@ -825,13 +900,43 @@ function drawPucks() {
   }
 }
 
+function drawPowerupBanner(now) {
+  if (!powerup) return;
+  const def = POWERUPS[powerup.type];
+  const left = Math.max(0, powerup.until - simTime);
+  const frac = clamp(left / (def.duration * 1000), 0, 1);
+  const bw = 190, bh = 34;
+  const bx = W / 2 - bw / 2, by = launchLineY + 10;
+  ctx.save();
+  const ending = left < 2000;
+  ctx.globalAlpha = ending ? 0.55 + 0.45 * Math.sin(now / 80) : 1;
+  if (aiming) ctx.globalAlpha *= 0.35; // stay out of the way of the aim guide
+  ctx.fillStyle = 'rgba(16,20,44,0.85)';
+  roundRect(bx, by, bw, bh, 10); ctx.fill();
+  ctx.strokeStyle = def.color;
+  glow(def.color, 10);
+  ctx.lineWidth = 1.6;
+  roundRect(bx, by, bw, bh, 10); ctx.stroke();
+  ctx.shadowBlur = 0;
+  ctx.fillStyle = def.color;
+  ctx.font = '800 13px system-ui, sans-serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(`${def.icon} ${def.label} ${(left / 1000).toFixed(1)}s`, W / 2, by + 13);
+  ctx.globalAlpha *= 0.9;
+  roundRect(bx + 8, by + bh - 8, Math.max(3, (bw - 16) * frac), 3, 1.5); ctx.fill();
+  ctx.restore();
+}
+
 function drawLauncher(now) {
   const ready = canLaunch();
   const pulse = 1 + 0.04 * Math.sin(now / 260);
   const r = puckRadius(currentValue);
+  const puColor = powerup ? POWERUPS[powerup.type].color : null;
   // pad ring
   ctx.save();
-  ctx.strokeStyle = ready ? 'rgba(34,211,238,0.5)' : 'rgba(120,130,160,0.25)';
+  ctx.strokeStyle = ready ? (puColor || 'rgba(34,211,238,0.5)') : 'rgba(120,130,160,0.25)';
+  if (puColor && ready) { ctx.globalAlpha = 0.7 + 0.3 * Math.sin(now / 120); glow(puColor, 10); }
   ctx.setLineDash([4, 6]);
   ctx.lineWidth = 1.5;
   ctx.beginPath();
@@ -920,6 +1025,22 @@ function drawAimGuide() {
       ctx.fill();
     }
     drawn += len;
+  }
+  // multi shot: hint the two extra spread rays
+  if (powerup && powerup.type === 'multi') {
+    for (const sgn of [-1, 1]) {
+      const a = sgn * POWERUPS.multi.spread;
+      const rdx = v.dx * Math.cos(a) - v.dy * Math.sin(a);
+      const rdy = v.dx * Math.sin(a) + v.dy * Math.cos(a);
+      for (let i = 1; i <= 9; i++) {
+        const d0 = r + 8 + i * 16;
+        ctx.globalAlpha = clamp(0.55 - i * 0.05, 0.1, 0.55);
+        ctx.fillStyle = color;
+        ctx.beginPath();
+        ctx.arc(launcherX + rdx * d0, launcherY + rdy * d0, 2.4, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
   }
   // arrowhead at end of first segment
   const s0 = segs[0];
@@ -1026,14 +1147,45 @@ function drawHUD(now) {
     ctx.fillText(o.value, x + 16, y + chipH / 2 + 9);
     ctx.shadowBlur = 0;
     // reward
+    const rushLive = o.rush && !o.rush.missed && o.rush.deadline;
+    const rushLeft = rushLive ? Math.max(0, (o.rush.deadline - simTime) / 1000) : 0;
+    const rdef = rushLive ? POWERUPS[o.rush.type] : null;
+    const rushPulse = rushLive && rushLeft <= 3 ? 0.55 + 0.45 * Math.sin(now / 90) : 1;
     ctx.textAlign = 'center';
     ctx.fillStyle = 'rgba(220,226,255,0.9)';
     ctx.font = '700 14px system-ui, sans-serif';
     if (mode === 'timed') {
-      ctx.fillText('+' + o.points + ' pts', x + pw * 0.5, y + chipH * 0.32);
-      ctx.fillStyle = '#facc15';
-      ctx.font = '700 13px system-ui, sans-serif';
-      ctx.fillText('⏱ +' + o.time + 's', x + pw * 0.5, y + chipH * 0.66);
+      if (rushLive) {
+        ctx.font = '700 12px system-ui, sans-serif';
+        ctx.fillText('+' + o.points + ' pts', x + pw * 0.5, y + chipH * 0.24);
+        ctx.fillStyle = '#facc15';
+        ctx.font = '700 11px system-ui, sans-serif';
+        ctx.fillText('⏱ +' + o.time + 's', x + pw * 0.5, y + chipH * 0.5);
+        ctx.fillStyle = rdef.color;
+        ctx.globalAlpha = rushPulse;
+        ctx.font = '800 11px system-ui, sans-serif';
+        ctx.fillText(`${rdef.icon} ${rdef.label} ${Math.ceil(rushLeft)}s`, x + pw * 0.5, y + chipH * 0.78);
+        ctx.globalAlpha = 1;
+      } else {
+        ctx.fillText('+' + o.points + ' pts', x + pw * 0.5, y + chipH * 0.32);
+        ctx.fillStyle = '#facc15';
+        ctx.font = '700 13px system-ui, sans-serif';
+        ctx.fillText('⏱ +' + o.time + 's', x + pw * 0.5, y + chipH * 0.66);
+      }
+    } else if (rushLive) {
+      ctx.fillStyle = rdef.color;
+      ctx.globalAlpha = rushPulse;
+      ctx.font = '800 13px system-ui, sans-serif';
+      ctx.fillText(`${rdef.icon} ${rdef.label} · ${Math.ceil(rushLeft)}s`, x + pw * 0.5, y + chipH * 0.5);
+      ctx.globalAlpha = 1;
+    }
+    // rush window drains as a thin bar along the chip's bottom edge
+    if (rushLive) {
+      const rf = clamp(rushLeft / o.rush.window, 0, 1);
+      ctx.fillStyle = rdef.color;
+      ctx.globalAlpha = 0.85;
+      roundRect(x + 10, y + chipH - 7, Math.max(3, (pw - 20) * rf), 3, 1.5); ctx.fill();
+      ctx.globalAlpha = 1;
     }
     // next target preview
     ctx.fillStyle = 'rgba(150,160,200,0.6)';
@@ -1105,8 +1257,8 @@ function drawMenu(now) {
   const lines = [
     'Point where to shoot, or pull back like a cue.',
     'Slam equal pucks together to merge their sum.',
-    'Build the TARGET number shown up top —',
-    'every target scores points and adds ⏱ time!'
+    'Build the TARGET number for points & ⏱ time.',
+    'Beat ⚡ RUSH targets fast to win power-ups!'
   ];
   lines.forEach((l, i) => ctx.fillText(l, W / 2, cy + 88 + i * 24));
   // mode buttons
@@ -1223,6 +1375,7 @@ function render(now) {
   if (state === 'play') {
     drawLauncher(now);
     drawAimGuide();
+    drawPowerupBanner(now);
   }
   drawEffects();
   if (state !== 'menu') drawHUD(now);
@@ -1319,7 +1472,8 @@ window.__dbg = {
   clear() { for (const p of [...pucks]) removePuck(p); },
   roll: randLaunchValue,
   step(ticks) { for (let i = 0; i < (ticks || 1); i++) stepPhysics(); },
-  get state() { return { state, mode, score, timeLeft, pucks: pucks.map(p => ({ v: p.value, x: p.body.position.x | 0, y: p.body.position.y | 0 })), objective: objective && { v: objective.value, pts: objective.points, time: objective.time }, next: nextObjective && { v: nextObjective.value }, objectivesCompleted }; },
+  power(type) { activatePowerup(type || 'rapid', W / 2, H / 2); },
+  get state() { return { state, mode, score, timeLeft, pucks: pucks.map(p => ({ v: p.value, x: p.body.position.x | 0, y: p.body.position.y | 0 })), objective: objective && { v: objective.value, pts: objective.points, time: objective.time, rush: objective.rush && { type: objective.rush.type, missed: objective.rush.missed, left: +((objective.rush.deadline - simTime) / 1000).toFixed(1) } }, next: nextObjective && { v: nextObjective.value }, objectivesCompleted, powerup: powerup && { type: powerup.type, left: +((powerup.until - simTime) / 1000).toFixed(1) } }; },
   set time(t) { timeLeft = t; },
   get lowGfx() { return lowGfx; },
   set lowGfx(on) { setLowGfx(!!on); }
