@@ -61,8 +61,9 @@ const LAUNCH_COOLDOWN = 380;  // ms between shots
 const AIM_MAX_TILT = 1.22;    // radians either side of straight up
 
 const OBJ_POINTS = { 4: 40, 8: 100, 16: 240, 32: 600, 64: 1400, 128: 3200, 256: 7000, 512: 15000 };
-const TIME_CAP = 150;          // banked time can never exceed this
-const TIME_BONUS_DECAY = 0.93; // each completed target shrinks later time bonuses (floor 3s)
+const TIME_CAP = 120;          // banked time can never exceed this
+const TIME_BONUS_DECAY = 0.88; // each completed target shrinks later time bonuses (floor 2s);
+                               // tuned so even blitz-speed runs end near the 5-minute mark
 const MAX_PUCK = 512;          // merges beyond the biggest possible target detonate for points
 
 // ---------- Power-ups ----------
@@ -363,7 +364,7 @@ function objectivePool() {
 // time bonuses shrink as the run goes on, so banking time forever isn't
 // possible; the preview in the target chip uses the same formula
 function timeGrant(o) {
-  return Math.max(3, Math.round(o.time * Math.pow(TIME_BONUS_DECAY, objectivesCompleted)));
+  return Math.max(2, Math.round(o.time * Math.pow(TIME_BONUS_DECAY, objectivesCompleted)));
 }
 
 function makeObjective(excludeValue) {
