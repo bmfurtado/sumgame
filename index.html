@@ -277,6 +277,7 @@ let menuButtons = null;
 let menuSoundRect = null, menuGfxRect = null, pauseRect = null, pausedButtons = null;
 let score = 0, scoreShown = 0, best = 0;
 let timeLeft = START_TIME;
+let clockStarted = false;      // timed mode: the clock only drains after the first shot
 let lastTickSecond = -1;
 let warned30 = false;          // 30s warning fired (re-arms if bonuses push time back up)
 let objective = null, nextObjective = null;   // {value, points, time, flash, rush}
@@ -600,7 +601,7 @@ function updateEffects(dt) {
 function startGame() {
   for (const p of [...pucks]) removePuck(p);
   particles = []; floaters = []; shockwaves = []; mergeQueue.length = 0;
-  score = 0; scoreShown = 0; timeLeft = START_TIME; lastTickSecond = -1; warned30 = false;
+  score = 0; scoreShown = 0; timeLeft = START_TIME; clockStarted = false; lastTickSecond = -1; warned30 = false;
   objectivesCompleted = 0; biggestPuck = 0;
   pendingTargetCheck = 0;
   powers = [];
@@ -679,6 +680,7 @@ function launch() {
   }
   sfx.launch(v.power);
   lastLaunch = simTime;
+  clockStarted = true;
   currentValue = nextValue;
   nextValue = randLaunchValue();
 }
@@ -828,7 +830,7 @@ function frame(now) {
       }
     }
 
-    if (mode === 'timed') {
+    if (mode === 'timed' && clockStarted) {
       const prevTime = timeLeft;
       // drain by simulated time, not wall clock — if physics falls behind on a
       // slow device the whole game slows in lockstep instead of the timer
@@ -1073,6 +1075,16 @@ function drawLauncher(now) {
   ctx.fillText('NEXT', nx, ny - nr - 8);
   ctx.restore();
   drawPuckAt(nx, ny, nr, nextValue, puckColor(nextValue), 0.75);
+  // the clock waits for the opening shot — say so
+  if (state === 'play' && mode === 'timed' && !clockStarted && !aiming) {
+    ctx.save();
+    ctx.globalAlpha = 0.55 + 0.3 * Math.sin(now / 300);
+    ctx.fillStyle = '#facc15';
+    ctx.font = '600 13px system-ui, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('⏱ the clock starts on your first shot', W / 2, launcherY - 104);
+    ctx.restore();
+  }
   // hint early in round
   if (state === 'play' && pucks.length <= 4 && performance.now() - startedAt < 6000 && !aiming) {
     ctx.save();
@@ -1221,7 +1233,7 @@ function drawHUD(now) {
     const tColor = frozen ? '#7dd3fc' : urgent ? '#f87171' : warn ? '#facc15' : '#22d3ee';
     ctx.textAlign = 'right';
     ctx.fillStyle = 'rgba(150,160,200,0.7)';
-    ctx.fillText(frozen ? '❄ FROZEN' : 'TIME', W - 16, topY + 10);
+    ctx.fillText(frozen ? '❄ FROZEN' : state === 'play' && !clockStarted ? 'READY' : 'TIME', W - 16, topY + 10);
     ctx.fillStyle = tColor;
     glow(tColor, urgent ? 16 : 8);
     const tPulse = urgent && state === 'play' ? 1 + 0.06 * Math.sin(now / 90) : 1;
@@ -1586,6 +1598,7 @@ window.__dbg = {
     const p = clamp(power || 12, MIN_POWER, MAX_POWER);
     createPuck(launcherX, launcherY, value || currentValue, Math.cos(ang) * p, Math.sin(ang) * p);
     sfx.launch(p);
+    clockStarted = true;
     currentValue = nextValue; nextValue = randLaunchValue();
   },
   spawn(x, y, v, vx, vy) { return createPuck(x, y, v, vx, vy); },
@@ -1593,7 +1606,7 @@ window.__dbg = {
   roll: randLaunchValue,
   step(ticks) { for (let i = 0; i < (ticks || 1); i++) stepPhysics(); },
   power(type) { activatePowerup(type || 'rapid', W / 2, H / 2); },
-  get state() { return { state, mode, score, timeLeft, pucks: pucks.map(p => ({ v: p.value, x: p.body.position.x | 0, y: p.body.position.y | 0 })), objective: objective && { v: objective.value, pts: objective.points, time: objective.time, rush: objective.rush && { type: objective.rush.type, missed: objective.rush.missed, window: objective.rush.window, left: +((objective.rush.deadline - simTime) / 1000).toFixed(1) } }, next: nextObjective && { v: nextObjective.value }, objectivesCompleted, powerups: powers.map(p => ({ type: p.type, left: +((p.until - simTime) / 1000).toFixed(1) })) }; },
+  get state() { return { state, mode, score, timeLeft, clockStarted, pucks: pucks.map(p => ({ v: p.value, x: p.body.position.x | 0, y: p.body.position.y | 0 })), objective: objective && { v: objective.value, pts: objective.points, time: objective.time, rush: objective.rush && { type: objective.rush.type, missed: objective.rush.missed, window: objective.rush.window, left: +((objective.rush.deadline - simTime) / 1000).toFixed(1) } }, next: nextObjective && { v: nextObjective.value }, objectivesCompleted, powerups: powers.map(p => ({ type: p.type, left: +((p.until - simTime) / 1000).toFixed(1) })) }; },
   set time(t) { timeLeft = t; },
   get lowGfx() { return lowGfx; },
   set lowGfx(on) { setLowGfx(!!on); }
